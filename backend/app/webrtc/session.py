@@ -208,6 +208,8 @@ class WebRTCSession:
                     self._llm_task = asyncio.ensure_future(
                         self._run_llm(f"continue reading from sentence {next_idx}", "auto_continue")
                     )
+                elif doc:
+                    await self._send_json({"type": "doc_reading_pause"})
 
         elif event_type == "doc_save_highlight":
             doc_id = str(payload.get("doc_id", ""))
@@ -561,9 +563,9 @@ class WebRTCSession:
             item = await queue.get()
             if item is None or self._interrupt_event.is_set():
                 break
-            sentence, sentence_idx = item
+            tts_text, sentence_idx, display_text = item
             try:
-                wav_bytes, sr = await tts_service.synthesize(sentence)
+                wav_bytes, sr = await tts_service.synthesize(tts_text)
             except Exception as err:
                 logger.warning(
                     "session_id={} event=tts_error error={}", self.session_id, err
@@ -575,6 +577,12 @@ class WebRTCSession:
                 tts_started = True
                 tts_t0 = perf_counter()
                 await self._send_json({"type": "tts_start"})
+            if sentence_idx is not None:
+                await self._send_json({
+                    "type": "doc_highlight",
+                    "sentence_idx": sentence_idx,
+                    "word_count": len((display_text or tts_text).split()),
+                })
             tts_ms = round((perf_counter() - tts_t0) * 1000, 2)
             wav_b64 = base64.b64encode(wav_bytes).decode()
             await self._send_json({
@@ -582,7 +590,7 @@ class WebRTCSession:
                 "data": wav_b64,
                 "sample_rate": sr,
                 "tts_ms": tts_ms,
-                "sentence_text": sentence,
+                "sentence_text": display_text or tts_text,
                 "sentence_idx": sentence_idx,
             })
 
@@ -649,7 +657,7 @@ class WebRTCSession:
                 f"No document currently loaded. Ask the user which one they want to explore."
             )
 
-        sent_queue: asyncio.Queue[tuple[str, int | None] | None] = asyncio.Queue()
+        sent_queue: asyncio.Queue[tuple[str, int | None, str | None] | None] = asyncio.Queue()
         tts_task = asyncio.create_task(self._tts_sentence_pipeline(sent_queue))
         self._tts_task = tts_task
 
@@ -663,12 +671,15 @@ class WebRTCSession:
             doc = get_document_store().get_document(self._active_document_id)
             if doc:
                 start_idx = 0 if restart_from_beginning or self._last_read_sentence_idx < 0 else self._last_read_sentence_idx + 1
-                end_idx = min(start_idx + 6, len(doc.sentences))
+                end_idx = len(doc.sentences)
                 selected_sentences = [
                     (idx, doc.sentences[idx])
                     for idx in range(start_idx, end_idx)
                     if 0 <= idx < len(doc.sentences)
                 ]
+                if not selected_sentences:
+                    await self._send_json({"type": "doc_reading_pause"})
+                    return
                 await self._send_json({"type": "llm_start", "user_text": text})
                 await self._send_json({
                     "type": "doc_read_start",
@@ -680,12 +691,7 @@ class WebRTCSession:
                 rendered_text = "\n".join(sentence for _, sentence in selected_sentences)
                 for sentence_idx, sentence in selected_sentences:
                     self._last_read_sentence_idx = sentence_idx
-                    await self._send_json({
-                        "type": "doc_highlight",
-                        "sentence_idx": sentence_idx,
-                        "word_count": len(sentence.split()),
-                    })
-                    await sent_queue.put((clean_for_tts(sentence), sentence_idx))
+                    await sent_queue.put((clean_for_tts(sentence), sentence_idx, sentence))
 
                 await self._send_json({"type": "llm_partial", "text": rendered_text})
                 await self._send_json({"type": "llm_final", "text": rendered_text, "llm_ms": 0.0})
@@ -743,12 +749,7 @@ class WebRTCSession:
                             )
                             if sentence_text:
                                 rendered_reading_segments.append(sentence_text)
-                                await sent_queue.put((clean_for_tts(sentence_text), sent_idx))
-                            await self._send_json({
-                                "type": "doc_highlight",
-                                "sentence_idx": sent_idx,
-                                "word_count": int(action.params[1]),
-                            })
+                                await sent_queue.put((clean_for_tts(sentence_text), sent_idx, sentence_text))
                         except (ValueError, IndexError):
                             pass
                     elif action.kind == "search" and action.params:
@@ -784,7 +785,7 @@ class WebRTCSession:
                         sentence = clean_for_tts(tail[: m.end()].strip())
                         if sentence:
                             sentence_idx = pending_tts_sentence_idxs.pop(0) if pending_tts_sentence_idxs else None
-                            await sent_queue.put((sentence, sentence_idx))
+                            await sent_queue.put((sentence, sentence_idx, None))
                         processed_chars += m.end()
                         tail = display_response[processed_chars:]
 
@@ -805,7 +806,7 @@ class WebRTCSession:
             if not self._interrupt_event.is_set() and call_error is None:
                 remaining = clean_for_tts(display_response[processed_chars:].strip())
                 if remaining:
-                    sent_queue.put_nowait(remaining)
+                    sent_queue.put_nowait((remaining, None, None))
             sent_queue.put_nowait(None)
 
         with suppress(asyncio.CancelledError):
@@ -851,11 +852,11 @@ class WebRTCSession:
 
         # Split on sentence-ending punctuation so each sentence gets its own tts_audio
         # message with sentence_text — matching the regular pipeline's synced text reveal.
-        sent_queue: asyncio.Queue[str | None] = asyncio.Queue()
+        sent_queue: asyncio.Queue[tuple[str, int | None, str | None] | None] = asyncio.Queue()
         for raw in re.split(r"(?<=[.!?])\s+", welcome.strip()):
             sentence = clean_for_tts(raw.strip())
             if sentence:
-                sent_queue.put_nowait(sentence)
+                sent_queue.put_nowait((sentence, None, None))
         sent_queue.put_nowait(None)
 
         await self._tts_sentence_pipeline(sent_queue, enable_barge_in=False)

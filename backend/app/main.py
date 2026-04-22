@@ -270,9 +270,9 @@ async def transcribe_stream(websocket: WebSocket) -> None:
             item = await queue.get()
             if item is None or interrupt_event.is_set():
                 break
-            sentence, sentence_idx = item
+            tts_text, sentence_idx, display_text = item
             try:
-                wav_bytes, sr = await tts_service.synthesize(sentence)
+                wav_bytes, sr = await tts_service.synthesize(tts_text)
             except Exception as tts_err:
                 logger.warning("request_id={} event=tts_error error={}", request_id, tts_err)
                 continue
@@ -282,6 +282,12 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                 tts_started = True
                 tts_t0 = perf_counter()
                 await send_json({"type": "tts_start"})
+            if sentence_idx is not None:
+                await send_json({
+                    "type": "doc_highlight",
+                    "sentence_idx": sentence_idx,
+                    "word_count": len((display_text or tts_text).split()),
+                })
             tts_ms = round((perf_counter() - tts_t0) * 1000, 2)
             wav_b64 = base64.b64encode(wav_bytes).decode()
             await send_json({
@@ -289,7 +295,7 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                 "data": wav_b64,
                 "sample_rate": sr,
                 "tts_ms": tts_ms,
-                "sentence_text": sentence,
+                "sentence_text": display_text or tts_text,
                 "sentence_idx": sentence_idx,
             })
 
@@ -363,7 +369,7 @@ async def transcribe_stream(websocket: WebSocket) -> None:
             )
 
         # Sentence queue feeds the TTS pipeline task which runs concurrently.
-        sent_queue: asyncio.Queue[tuple[str, int | None] | None] = asyncio.Queue()
+        sent_queue: asyncio.Queue[tuple[str, int | None, str | None] | None] = asyncio.Queue()
         tts_task = asyncio.create_task(_tts_sentence_pipeline(sent_queue))
         active_tts_task = tts_task
 
@@ -377,12 +383,15 @@ async def transcribe_stream(websocket: WebSocket) -> None:
             doc = get_document_store().get_document(active_document_id)
             if doc:
                 start_idx = 0 if restart_from_beginning or last_read_sentence_idx < 0 else last_read_sentence_idx + 1
-                end_idx = min(start_idx + 6, len(doc.sentences))
+                end_idx = len(doc.sentences)
                 selected_sentences = [
                     (idx, doc.sentences[idx])
                     for idx in range(start_idx, end_idx)
                     if 0 <= idx < len(doc.sentences)
                 ]
+                if not selected_sentences:
+                    await send_json({"type": "doc_reading_pause"})
+                    return
                 await send_json({"type": "llm_start", "user_text": text})
                 await send_json({
                     "type": "doc_read_start",
@@ -394,12 +403,7 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                 rendered_text = "\n".join(sentence for _, sentence in selected_sentences)
                 for sentence_idx, sentence in selected_sentences:
                     last_read_sentence_idx = sentence_idx
-                    await send_json({
-                        "type": "doc_highlight",
-                        "sentence_idx": sentence_idx,
-                        "word_count": len(sentence.split()),
-                    })
-                    await sent_queue.put((clean_for_tts(sentence), sentence_idx))
+                    await sent_queue.put((clean_for_tts(sentence), sentence_idx, sentence))
 
                 await send_json({"type": "llm_partial", "text": rendered_text})
                 await send_json({"type": "llm_final", "text": rendered_text, "llm_ms": 0.0})
@@ -457,12 +461,7 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                             )
                             if sentence_text:
                                 rendered_reading_segments.append(sentence_text)
-                                await sent_queue.put((clean_for_tts(sentence_text), sent_idx))
-                            await send_json({
-                                "type": "doc_highlight",
-                                "sentence_idx": sent_idx,
-                                "word_count": int(action.params[1]),
-                            })
+                                await sent_queue.put((clean_for_tts(sentence_text), sent_idx, sentence_text))
                         except (ValueError, IndexError):
                             pass
                     elif action.kind == "search" and action.params:
@@ -498,7 +497,7 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                         sentence = clean_for_tts(tail[: m.end()].strip())
                         if sentence:
                             sentence_idx = pending_tts_sentence_idxs.pop(0) if pending_tts_sentence_idxs else None
-                            await sent_queue.put((sentence, sentence_idx))
+                            await sent_queue.put((sentence, sentence_idx, None))
                             logger.debug("request_id={} event=sentence_queued len={}", request_id, len(sentence))
                         processed_chars += m.end()
                         tail = display_response[processed_chars:]
@@ -520,7 +519,7 @@ async def transcribe_stream(websocket: WebSocket) -> None:
             if not interrupt_event.is_set() and call_error is None:
                 remaining = clean_for_tts(display_response[processed_chars:].strip())
                 if remaining:
-                    sent_queue.put_nowait(remaining)
+                    sent_queue.put_nowait((remaining, None, None))
             sent_queue.put_nowait(None)  # sentinel — always delivered
 
         # Wait for all sentences to be synthesised and sent.
@@ -613,11 +612,11 @@ async def transcribe_stream(websocket: WebSocket) -> None:
 
         # Split on sentence-ending punctuation so each sentence gets its own tts_audio
         # message with sentence_text — matching the regular pipeline's synced text reveal.
-        sent_queue: asyncio.Queue[str | None] = asyncio.Queue()
+        sent_queue: asyncio.Queue[tuple[str, int | None, str | None] | None] = asyncio.Queue()
         for raw in re.split(r"(?<=[.!?])\s+", welcome.strip()):
             sentence = clean_for_tts(raw.strip())
             if sentence:
-                sent_queue.put_nowait(sentence)
+                sent_queue.put_nowait((sentence, None, None))
         sent_queue.put_nowait(None)
 
         await _tts_sentence_pipeline(sent_queue)
@@ -672,6 +671,8 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                             llm_task = asyncio.create_task(
                                 run_llm_stream(f"continue reading from sentence {next_idx}", "auto_continue")
                             )
+                        elif doc:
+                            await send_json({"type": "doc_reading_pause"})
                     continue
 
                 if event_type == "doc_save_highlight":

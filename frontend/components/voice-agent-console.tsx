@@ -221,6 +221,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
   const waveLevelsRef = useRef(initialWaveLevels);
   const startAttemptRef = useRef(0);
   const loadedDocumentIdRef = useRef<string | null>(null);
+  const resumeReadingAfterReplyRef = useRef(false);
 
   useEffect(() => {
     const saved = localStorage.getItem("nt-theme");
@@ -634,7 +635,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
 
           if (payload.type === "tts_done") {
             ttsAllChunksReceivedRef.current = true;
-            const triggerContinue = isReadingModeRef.current;
+            const triggerContinue = isReadingModeRef.current || resumeReadingAfterReplyRef.current;
             if (!ttsAudioReceivedRef.current) {
               const aid = activeAssistantIdRef.current;
               if (aid && pendingAssistantTextRef.current) {
@@ -667,11 +668,15 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
               startTransition(() => { setMode("listening"); });
             }
             // Auto-continue reading if still in reading mode
-            if (triggerContinue) setTimeout(() => sendToBackend({ type: "continue_reading" }), 400);
+            if (triggerContinue) {
+              resumeReadingAfterReplyRef.current = false;
+              setTimeout(() => sendToBackend({ type: "continue_reading" }), 400);
+            }
             return;
           }
 
           if (payload.type === "tts_interrupted") {
+            resumeReadingAfterReplyRef.current = isReadingModeRef.current;
             isReadingModeRef.current = false;
             clearTtsQueue();
             onDocumentEvent?.({ type: "tts_interrupted" });
@@ -699,6 +704,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
             pendingDocSentenceIdxRef.current = null;
             cancelHighlight();
             isReadingModeRef.current = true;
+            resumeReadingAfterReplyRef.current = false;
             onDocumentEvent?.({ type: "doc_read_start", doc_id: payload.doc_id ?? "", sentences: (payload.sentences ?? []) as string[], title: payload.title ?? "" });
             return;
           }
@@ -731,11 +737,13 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
           }
           if (payload.type === "doc_reading_pause") {
             isReadingModeRef.current = false;
+            resumeReadingAfterReplyRef.current = false;
             onDocumentEvent?.({ type: "doc_reading_pause" });
             return;
           }
           if (payload.type === "doc_reading_resume") {
             isReadingModeRef.current = true;
+            resumeReadingAfterReplyRef.current = false;
             onDocumentEvent?.({ type: "doc_reading_resume" });
             return;
           }
@@ -1052,7 +1060,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
 
         if (payload.type === "tts_done") {
           ttsAllChunksReceivedRef.current = true;
-          const triggerContinue = isReadingModeRef.current;
+          const triggerContinue = isReadingModeRef.current || resumeReadingAfterReplyRef.current;
           if (!ttsAudioReceivedRef.current) {
             const aid = activeAssistantIdRef.current;
             if (aid && pendingAssistantTextRef.current) {
@@ -1078,11 +1086,15 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
               socket.close();
             }
           }
-          if (triggerContinue) setTimeout(() => sendToBackend({ type: "continue_reading" }), 400);
+          if (triggerContinue) {
+            resumeReadingAfterReplyRef.current = false;
+            setTimeout(() => sendToBackend({ type: "continue_reading" }), 400);
+          }
           return;
         }
 
         if (payload.type === "tts_interrupted") {
+          resumeReadingAfterReplyRef.current = isReadingModeRef.current;
           isReadingModeRef.current = false;
           clearTtsQueue();
           onDocumentEvent?.({ type: "tts_interrupted" });
@@ -1110,6 +1122,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
           pendingDocSentenceIdxRef.current = null;
           cancelHighlight();
           isReadingModeRef.current = true;
+          resumeReadingAfterReplyRef.current = false;
           onDocumentEvent?.({ type: "doc_read_start", doc_id: payload.doc_id ?? "", sentences: (payload.sentences ?? []) as string[], title: payload.title ?? "" });
           return;
         }
@@ -1141,11 +1154,13 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
         }
         if (payload.type === "doc_reading_pause") {
           isReadingModeRef.current = false;
+          resumeReadingAfterReplyRef.current = false;
           onDocumentEvent?.({ type: "doc_reading_pause" });
           return;
         }
         if (payload.type === "doc_reading_resume") {
           isReadingModeRef.current = true;
+          resumeReadingAfterReplyRef.current = false;
           onDocumentEvent?.({ type: "doc_reading_resume" });
           return;
         }

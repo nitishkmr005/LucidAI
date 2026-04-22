@@ -1653,6 +1653,7 @@ button {
   background:
     linear-gradient(135deg, rgba(26, 71, 200, 0.1), rgba(26, 71, 200, 0.04));
   border: 1px solid var(--blue-border);
+  min-height: 132px;
 }
 
 .doc-live-label {
@@ -1666,10 +1667,12 @@ button {
 }
 
 .doc-live-text {
+  display: block;
   font-family: var(--font-lora), "Lora", "Georgia", serif;
   color: var(--text);
   font-size: 0.95rem;
   line-height: 1.7;
+  min-height: calc(1.7em * 3);
 }
 
 .doc-sentence {
@@ -1705,11 +1708,10 @@ button {
 }
 
 .doc-word--active {
-  background: linear-gradient(135deg, rgba(26, 71, 200, 0.2), rgba(59, 110, 232, 0.32));
-  border-radius: 6px;
-  padding: 1px 4px;
+  background: linear-gradient(135deg, rgba(26, 71, 200, 0.18), rgba(59, 110, 232, 0.28));
+  border-radius: 4px;
   transition: background 80ms ease, box-shadow 80ms ease, color 80ms ease;
-  box-shadow: 0 0 0 1px rgba(26, 71, 200, 0.12);
+  box-shadow: inset 0 0 0 1px rgba(26, 71, 200, 0.12);
   color: var(--text);
 }
 
