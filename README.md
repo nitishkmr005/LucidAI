@@ -1,4 +1,4 @@
-# Docent
+# LucidAI
 
 > Read aloud. Ask anything. Remember everything.
 
