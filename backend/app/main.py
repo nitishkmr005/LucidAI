@@ -15,18 +15,21 @@ from loguru import logger
 from app.models import HealthResponse, TranscriptionResponse
 from app.routers.documents import router as documents_router
 from app.services.document_store import get_document_store
-from app.services.llm import stream_llm_response
+from app.services.llm import complete_llm_response
 from app.services.search import web_search
 from app.services.stt import get_stt_service
 from app.services.tts import get_tts_service
 from app.services.vad import get_vad_service
-from app.utils.action_tags import extract_doc_actions
-from app.utils.emotion import strip_emotion_tags, clean_for_tts
-from app.utils.session_logger import LLMCallLog, STTRunLog, SessionLog, _iso, write_session_log
+from app.utils.document_turns import (
+    build_document_turn_context,
+    parse_document_turn_response,
+    resolve_document_by_name,
+)
+from app.utils.emotion import clean_for_tts
+from app.utils.session_logger import LLMCallLog, STTRunLog, SessionLog, TTSCallLog, _iso, write_session_log
 from app.webrtc.router import router as webrtc_router
 from config.logging import setup_logging
 from config.settings import get_settings
-from app.prompts.system import DOCUMENT_READING_PROMPT
 
 setup_logging()
 settings = get_settings()
@@ -35,14 +38,6 @@ _PAUSE_PATTERN = re.compile(
     r"^\s*(wait|hold on|hold up|one moment|one sec(?:ond)?|just a (?:moment|second|sec)|"
     r"give me a (?:second|moment|sec)|hang on|please wait|just wait|ok wait|okay wait|"
     r"stop|stop it|stop please|please stop|ok stop|okay stop)\s*[.!?,]?\s*$",
-    re.IGNORECASE,
-)
-_RESTART_FROM_BEGINNING_PATTERN = re.compile(
-    r"\b(start|read|begin|restart)\b.*\b(beginning|start|top)\b|\bstart over\b|\brestart\b",
-    re.IGNORECASE,
-)
-_DIRECT_READ_REQUEST_PATTERN = re.compile(
-    r"\b(read|start reading|read aloud|continue reading|resume reading|keep reading)\b",
     re.IGNORECASE,
 )
 
@@ -219,8 +214,8 @@ async def transcribe_stream(websocket: WebSocket) -> None:
     last_emit_at = 0.0
     last_text_sent = ""
     send_lock = asyncio.Lock()
-    llm_task: asyncio.Task[None] | None = None
-    active_tts_task: asyncio.Task[None] | None = None
+    llm_task: asyncio.Task | None = None
+    active_tts_task: asyncio.Task | None = None
     pending_llm_call: tuple[str, str] | None = None
     latest_llm_input = ""
     interrupt_event = asyncio.Event()
@@ -229,6 +224,7 @@ async def transcribe_stream(websocket: WebSocket) -> None:
     llm_responded = False  # True once a full response has been delivered this turn
     active_document_id: str | None = None  # currently loaded document
     last_read_sentence_idx: int = -1       # last sentence index highlighted during reading
+    resume_from_sentence_idx: int | None = None
 
     # ── Session log scaffolding ───────────────────────────────────────────────
     session_log = SessionLog(
@@ -240,7 +236,6 @@ async def transcribe_stream(websocket: WebSocket) -> None:
         stt_beam_size=settings.stt_beam_size,
         llm_model=settings.llm_model,
         llm_host=settings.ollama_host,
-        llm_system_prompt_preview=settings.llm_system_prompt[:100],
     )
 
     async def send_json(payload: dict[str, object]) -> None:
@@ -250,9 +245,17 @@ async def transcribe_stream(websocket: WebSocket) -> None:
             except (RuntimeError, WebSocketDisconnect):
                 pass
 
-    _SENT_BOUNDARY = re.compile(r"[.!?](?:\s|$)")
-    # Minimum characters for a sentence fragment to be sent to TTS individually.
-    _MIN_SENTENCE_CHARS = 15
+    def _build_llm_prompt_dump(*, user_text: str, document_context: str | None) -> str:
+        history = "\n".join(
+            f"{entry['role']}: {entry['content']}" for entry in conversation_history
+        )
+        parts = [
+            f"system: {settings.llm_system_prompt}",
+            f"document_context: {document_context or ''}",
+            f"history:\n{history}" if history else "history:",
+            f"user: {user_text}",
+        ]
+        return "\n\n".join(parts)
 
     async def _tts_sentence_pipeline(queue: asyncio.Queue[tuple[str, int | None, str | None] | None]) -> None:
         """
@@ -262,6 +265,7 @@ async def transcribe_stream(websocket: WebSocket) -> None:
         as soon as the first sentence boundary is detected — without waiting for
         the full LLM response to complete.  A ``None`` sentinel signals the end.
         """
+        nonlocal last_read_sentence_idx, resume_from_sentence_idx
         tts_service = get_tts_service()
         tts_started = False
         tts_t0 = perf_counter()
@@ -271,11 +275,32 @@ async def transcribe_stream(websocket: WebSocket) -> None:
             if item is None or interrupt_event.is_set():
                 break
             tts_text, sentence_idx, display_text = item
+            synth_started_at = perf_counter()
             try:
                 wav_bytes, sr = await tts_service.synthesize(tts_text)
             except Exception as tts_err:
+                session_log.tts_calls.append(
+                    TTSCallLog(
+                        timestamp=_iso(),
+                        latency_ms=round((perf_counter() - synth_started_at) * 1000, 2),
+                        input_text=tts_text,
+                        output_audio_bytes=0,
+                        output_sample_rate=0,
+                        error=str(tts_err),
+                    )
+                )
                 logger.warning("request_id={} event=tts_error error={}", request_id, tts_err)
                 continue
+            synth_latency_ms = round((perf_counter() - synth_started_at) * 1000, 2)
+            session_log.tts_calls.append(
+                TTSCallLog(
+                    timestamp=_iso(),
+                    latency_ms=synth_latency_ms,
+                    input_text=tts_text,
+                    output_audio_bytes=len(wav_bytes),
+                    output_sample_rate=sr,
+                )
+            )
             if interrupt_event.is_set():
                 break
             if not tts_started:
@@ -283,6 +308,10 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                 tts_t0 = perf_counter()
                 await send_json({"type": "tts_start"})
             if sentence_idx is not None:
+                last_read_sentence_idx = sentence_idx
+                resume_from_sentence_idx = sentence_idx
+                if active_document_id:
+                    get_document_store().save_reading_position(active_document_id, sentence_idx)
                 await send_json({
                     "type": "doc_highlight",
                     "sentence_idx": sentence_idx,
@@ -304,12 +333,96 @@ async def transcribe_stream(websocket: WebSocket) -> None:
         else:
             await send_json({"type": "tts_done"})
 
+    async def _play_tts_turn(
+        *,
+        user_text: str,
+        display_text: str,
+        utterances: list[tuple[str, int | None, str | None]],
+        llm_ms: float,
+    ) -> None:
+        nonlocal active_tts_task
+        await send_json({"type": "llm_start", "user_text": user_text})
+        await send_json({"type": "llm_partial", "text": display_text})
+        await send_json({"type": "llm_final", "text": display_text, "llm_ms": llm_ms})
+        if not utterances:
+            return
+
+        sent_queue: asyncio.Queue[tuple[str, int | None, str | None] | None] = asyncio.Queue()
+        for utterance in utterances:
+            await sent_queue.put(utterance)
+        await sent_queue.put(None)
+
+        tts_task = asyncio.create_task(_tts_sentence_pipeline(sent_queue))
+        active_tts_task = tts_task
+        with suppress(asyncio.CancelledError):
+            await tts_task
+        active_tts_task = None
+
+    def _split_text_for_tts(text: str) -> list[tuple[str, int | None, str | None]]:
+        utterances: list[tuple[str, int | None, str | None]] = []
+        for raw in re.split(r"(?<=[.!?])\s+", text.strip()):
+            sentence = clean_for_tts(raw.strip())
+            if sentence:
+                utterances.append((sentence, None, None))
+        return utterances
+
+    def _get_read_start_idx(*, restart_from_beginning: bool) -> int:
+        if restart_from_beginning:
+            return 0
+        if resume_from_sentence_idx is not None:
+            return max(0, resume_from_sentence_idx)
+        if last_read_sentence_idx >= 0:
+            return last_read_sentence_idx + 1
+        return 0
+
+    async def _run_document_read(
+        *,
+        doc_id: str,
+        user_text: str,
+        start_idx: int,
+        llm_ms: float,
+    ) -> str:
+        nonlocal active_document_id, resume_from_sentence_idx
+        doc = get_document_store().get_document(doc_id)
+        if not doc:
+            await _play_tts_turn(
+                user_text=user_text,
+                display_text="I couldn't find that document.",
+                utterances=_split_text_for_tts("I couldn't find that document."),
+                llm_ms=llm_ms,
+            )
+            return "I couldn't find that document."
+
+        if start_idx >= doc.sentence_count:
+            resume_from_sentence_idx = None
+            await send_json({"type": "doc_reading_pause"})
+            return ""
+
+        active_document_id = doc.doc_id
+        await send_json({
+            "type": "doc_read_start",
+            "doc_id": doc.doc_id,
+            "sentences": doc.sentences,
+            "title": doc.title,
+        })
+
+        utterances = [
+            (clean_for_tts(doc.sentences[idx]), idx, doc.sentences[idx])
+            for idx in range(start_idx, len(doc.sentences))
+            if clean_for_tts(doc.sentences[idx])
+        ]
+        await _play_tts_turn(user_text=user_text, display_text="", utterances=utterances, llm_ms=llm_ms)
+        if not interrupt_event.is_set():
+            resume_from_sentence_idx = None
+        return f"Reading {doc.title} from sentence {start_idx}."
+
     async def _handle_doc_search(query: str) -> None:
         results = await web_search(query, max_results=settings.web_search_max_results)
         await send_json({"type": "doc_search_result", "query": query, "results": results})
 
     async def run_llm_stream(text: str, trigger: str) -> None:
-        nonlocal llm_task, active_tts_task, pending_llm_call, latest_llm_input, last_text_sent, chunk_count, last_emit_at, llm_responded, active_document_id, last_read_sentence_idx
+        nonlocal llm_task, pending_llm_call, latest_llm_input, last_text_sent, chunk_count, last_emit_at
+        nonlocal llm_responded, active_document_id, last_read_sentence_idx, resume_from_sentence_idx
         llm_responded = False
         # Clear audio buffer — this utterance is captured; next audio is a new turn
         pcm_buffer.clear()
@@ -319,193 +432,104 @@ async def transcribe_stream(websocket: WebSocket) -> None:
         interrupt_event.clear()
         llm_t0 = perf_counter()
         call_ts = _iso()
-        full_response = ""
-        display_response = ""   # full_response with action tags removed
-        processed_chars = 0     # chars already extracted as complete sentences (from display_response)
+        display_response = ""
         llm_ms = 0.0
         call_error: str | None = None
         latest_llm_input = text
-        doc_actions_seen: set[str] = set()
-        pending_tts_sentence_idxs: list[int | None] = []
-        reading_turn = False
-        rendered_reading_segments: list[str] = []
-        restart_from_beginning = bool(_RESTART_FROM_BEGINNING_PATTERN.search(text))
-
-        if restart_from_beginning:
-            last_read_sentence_idx = -1
-
-        # Build document context when a document is loaded
-        document_context: str | None = None
-        if active_document_id:
-            doc = get_document_store().get_document(active_document_id)
-            if doc:
-                docs_list = get_document_store().list_documents()
-                doc_names = ", ".join(f"'{d['title']}' (id: {d['doc_id']})" for d in docs_list)
-                position_hint = (
-                    f"Reading position: last read sentence {last_read_sentence_idx}. "
-                    f"To continue, start from sentence {last_read_sentence_idx + 1}.\n"
-                    if last_read_sentence_idx >= 0 else ""
-                )
-                restart_hint = (
-                    "The user explicitly asked to start from the beginning. Start from sentence 0 and ignore any saved reading position.\n"
-                    if restart_from_beginning else ""
-                )
-                document_context = (
-                    f"{DOCUMENT_READING_PROMPT}\n\n"
-                    f"Available documents: {doc_names}\n"
-                    f"Currently loaded: '{doc.title}' (id: {doc.doc_id})\n"
-                    f"Total sentences: {doc.sentence_count}\n"
-                    f"{restart_hint}{position_hint}\n"
-                    f"Document content (sentences numbered for action tags):\n"
-                    + "\n".join(f"[{i}] {s}" for i, s in enumerate(doc.sentences))
-                )
-        elif get_document_store().list_documents():
-            docs_list = get_document_store().list_documents()
-            doc_names = ", ".join(f"'{d['title']}' (id: {d['doc_id']})" for d in docs_list)
-            document_context = (
-                f"{DOCUMENT_READING_PROMPT}\n\n"
-                f"Available documents: {doc_names}\n"
-                f"No document currently loaded. Ask the user which one they want to explore."
-            )
-
-        # Sentence queue feeds the TTS pipeline task which runs concurrently.
-        sent_queue: asyncio.Queue[tuple[str, int | None, str | None] | None] = asyncio.Queue()
-        tts_task = asyncio.create_task(_tts_sentence_pipeline(sent_queue))
-        active_tts_task = tts_task
-
-        direct_read_requested = bool(
-            active_document_id
-            and _DIRECT_READ_REQUEST_PATTERN.search(text)
-            and ("?" not in text or "read" in text.lower())
-        )
-
-        if direct_read_requested:
-            doc = get_document_store().get_document(active_document_id)
-            if doc:
-                start_idx = 0 if restart_from_beginning or last_read_sentence_idx < 0 else last_read_sentence_idx + 1
-                end_idx = len(doc.sentences)
-                selected_sentences = [
-                    (idx, doc.sentences[idx])
-                    for idx in range(start_idx, end_idx)
-                    if 0 <= idx < len(doc.sentences)
-                ]
-                if not selected_sentences:
-                    await send_json({"type": "doc_reading_pause"})
-                    return
-                await send_json({"type": "llm_start", "user_text": text})
-                await send_json({
-                    "type": "doc_read_start",
-                    "doc_id": doc.doc_id,
-                    "sentences": doc.sentences,
-                    "title": doc.title,
-                })
-
-                rendered_text = "\n".join(sentence for _, sentence in selected_sentences)
-                for sentence_idx, sentence in selected_sentences:
-                    last_read_sentence_idx = sentence_idx
-                    await sent_queue.put((clean_for_tts(sentence), sentence_idx, sentence))
-
-                await send_json({"type": "llm_partial", "text": rendered_text})
-                await send_json({"type": "llm_final", "text": rendered_text, "llm_ms": 0.0})
-                await sent_queue.put(None)
-                await tts_task
-                return
 
         try:
-            await send_json({"type": "llm_start", "user_text": text})
-            async for token in stream_llm_response(
+            document_context = build_document_turn_context(
+                user_text=text,
+                active_document_id=active_document_id,
+                last_read_sentence_idx=last_read_sentence_idx,
+            )
+            full_prompt = _build_llm_prompt_dump(user_text=text, document_context=document_context)
+            full_response = await complete_llm_response(
                 text,
                 conversation_history=list(conversation_history),
                 document_context=document_context,
-            ):
-                if interrupt_event.is_set():
-                    break
-                full_response += token
-
-                # Extract and dispatch new document action tags
-                cleaned, actions = extract_doc_actions(full_response)
-                display_response = strip_emotion_tags(cleaned)
-                for action in actions:
-                    sig = f"{action.kind}:{':'.join(action.params)}"
-                    if sig in doc_actions_seen:
-                        continue
-                    doc_actions_seen.add(sig)
-                    if action.kind == "list_docs":
-                        docs = get_document_store().list_documents()
-                        await send_json({"type": "doc_list", "documents": docs})
-                    elif action.kind == "read" and action.params:
-                        reading_turn = True
-                        doc_id = action.params[0]
-                        doc = get_document_store().get_document(doc_id)
-                        if doc:
-                            active_document_id = doc_id
-                            if restart_from_beginning:
-                                last_read_sentence_idx = -1
-                            await send_json({
-                                "type": "doc_read_start",
-                                "doc_id": doc_id,
-                                "sentences": doc.sentences,
-                                "title": doc.title,
-                            })
-                    elif action.kind == "highlight" and len(action.params) >= 2:
-                        try:
-                            reading_turn = True
-                            sent_idx = int(action.params[0])
-                            last_read_sentence_idx = sent_idx
-                            pending_tts_sentence_idxs.append(sent_idx)
-                            doc = get_document_store().get_document(active_document_id) if active_document_id else None
-                            sentence_text = (
-                                doc.sentences[sent_idx]
-                                if doc and 0 <= sent_idx < len(doc.sentences)
-                                else None
-                            )
-                            if sentence_text:
-                                rendered_reading_segments.append(sentence_text)
-                                await sent_queue.put((clean_for_tts(sentence_text), sent_idx, sentence_text))
-                        except (ValueError, IndexError):
-                            pass
-                    elif action.kind == "search" and action.params:
-                        query = ":".join(action.params)
-                        await send_json({"type": "doc_search_start", "query": query})
-                        asyncio.create_task(_handle_doc_search(query))
-                    elif action.kind == "save_snippet" and action.params:
-                        await send_json({"type": "doc_save_snippet", "term": ":".join(action.params)})
-                    elif action.kind == "export" and action.params:
-                        fmt = action.params[0]
-                        if active_document_id and fmt in ("pdf", "docx"):
-                            await send_json({
-                                "type": "doc_export",
-                                "format": fmt,
-                                "download_url": f"/documents/{active_document_id}/export/{fmt}",
-                            })
-                    elif action.kind == "reading_pause":
-                        await send_json({"type": "doc_reading_pause"})
-                    elif action.kind == "reading_resume":
-                        reading_turn = True
-                        await send_json({"type": "doc_reading_resume"})
-
-                transcript_text = "\n".join(rendered_reading_segments) if reading_turn and rendered_reading_segments else display_response
-                await send_json({"type": "llm_partial", "text": transcript_text})
-
-                # Extract complete sentences from the unprocessed tail and enqueue for TTS
-                if not reading_turn:
-                    tail = display_response[processed_chars:]
-                    while True:
-                        m = _SENT_BOUNDARY.search(tail)
-                        if not m or m.end() < _MIN_SENTENCE_CHARS:
-                            break
-                        sentence = clean_for_tts(tail[: m.end()].strip())
-                        if sentence:
-                            sentence_idx = pending_tts_sentence_idxs.pop(0) if pending_tts_sentence_idxs else None
-                            await sent_queue.put((sentence, sentence_idx, None))
-                            logger.debug("request_id={} event=sentence_queued len={}", request_id, len(sentence))
-                        processed_chars += m.end()
-                        tail = display_response[processed_chars:]
-
+            )
             llm_ms = round((perf_counter() - llm_t0) * 1000, 2)
             logger.info("request_id={} event=llm_done llm_ms={}", request_id, llm_ms)
-            final_text = "\n".join(rendered_reading_segments) if reading_turn and rendered_reading_segments else display_response
-            await send_json({"type": "llm_final", "text": final_text, "llm_ms": llm_ms})
+            decision = parse_document_turn_response(full_response) if document_context else None
+
+            if decision is not None:
+                if decision.action == "list_documents":
+                    docs = get_document_store().list_documents()
+                    await send_json({"type": "doc_list", "documents": docs})
+                    response_text = decision.response_text or (
+                        "Available documents are: " + ", ".join(doc["title"] for doc in docs)
+                    )
+                    await _play_tts_turn(
+                        user_text=text,
+                        display_text=response_text,
+                        utterances=_split_text_for_tts(response_text),
+                        llm_ms=llm_ms,
+                    )
+                    display_response = response_text
+                elif decision.action == "ask_document_clarification":
+                    response_text = decision.response_text or "Which document would you like me to read?"
+                    await _play_tts_turn(
+                        user_text=text,
+                        display_text=response_text,
+                        utterances=_split_text_for_tts(response_text),
+                        llm_ms=llm_ms,
+                    )
+                    display_response = response_text
+                elif decision.action == "pause_reading":
+                    resume_from_sentence_idx = None
+                    response_text = decision.response_text or "Pausing here."
+                    await send_json({"type": "doc_reading_pause"})
+                    await _play_tts_turn(
+                        user_text=text,
+                        display_text=response_text,
+                        utterances=_split_text_for_tts(response_text),
+                        llm_ms=llm_ms,
+                    )
+                    display_response = response_text
+                elif decision.action in {"read_document", "continue_reading"}:
+                    target_doc = resolve_document_by_name(
+                        decision.document_name,
+                        active_document_id=active_document_id,
+                    )
+                    if target_doc is None:
+                        response_text = "I couldn't tell which document to read. Which one do you want?"
+                        await _play_tts_turn(
+                            user_text=text,
+                            display_text=response_text,
+                            utterances=_split_text_for_tts(response_text),
+                            llm_ms=llm_ms,
+                        )
+                        display_response = response_text
+                    else:
+                        if decision.restart_from_beginning:
+                            last_read_sentence_idx = -1
+                            resume_from_sentence_idx = None
+                        elif decision.action == "continue_reading" and resume_from_sentence_idx is None and last_read_sentence_idx < 0:
+                            resume_from_sentence_idx = 0
+                        display_response = await _run_document_read(
+                            doc_id=target_doc.doc_id,
+                            user_text=text,
+                            start_idx=_get_read_start_idx(restart_from_beginning=decision.restart_from_beginning),
+                            llm_ms=llm_ms,
+                        )
+                else:
+                    response_text = decision.response_text or "I'm not sure how to help with that yet."
+                    await _play_tts_turn(
+                        user_text=text,
+                        display_text=response_text,
+                        utterances=_split_text_for_tts(response_text),
+                        llm_ms=llm_ms,
+                    )
+                    display_response = response_text
+            else:
+                display_response = full_response.strip()
+                await _play_tts_turn(
+                    user_text=text,
+                    display_text=display_response,
+                    utterances=_split_text_for_tts(display_response),
+                    llm_ms=llm_ms,
+                )
 
         except Exception as llm_err:
             llm_ms = round((perf_counter() - llm_t0) * 1000, 2)
@@ -514,20 +538,6 @@ async def transcribe_stream(websocket: WebSocket) -> None:
             with suppress(Exception):
                 await send_json({"type": "llm_error", "message": "LLM unavailable — is Ollama running?"})
 
-        finally:
-            # Enqueue any remaining text fragment, then signal end of stream.
-            if not interrupt_event.is_set() and call_error is None:
-                remaining = clean_for_tts(display_response[processed_chars:].strip())
-                if remaining:
-                    sent_queue.put_nowait((remaining, None, None))
-            sent_queue.put_nowait(None)  # sentinel — always delivered
-
-        # Wait for all sentences to be synthesised and sent.
-        with suppress(asyncio.CancelledError):
-            await tts_task
-        active_tts_task = None
-
-        approx_tokens = round(len(display_response.split()) * 1.3) if display_response else 0
         session_log.llm_calls.append(
             LLMCallLog(
                 timestamp=call_ts,
@@ -535,13 +545,8 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                 latency_ms=llm_ms,
                 model=settings.llm_model,
                 host=settings.ollama_host,
-                system_prompt_preview=settings.llm_system_prompt[:100],
-                input_transcript=text,
-                input_length_chars=len(text),
+                full_prompt=full_prompt,
                 output_response=display_response,
-                output_preview=display_response[:200],
-                output_length_chars=len(display_response),
-                approx_tokens_out=approx_tokens,
                 cancelled=False,
                 error=call_error,
             )
@@ -645,6 +650,8 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                     doc = get_document_store().get_document(doc_id)
                     if doc:
                         active_document_id = doc_id
+                        last_read_sentence_idx = -1
+                        resume_from_sentence_idx = None
                         annotations = get_document_store().load_annotations(doc_id)
                         await send_json({
                             "type": "doc_opened",
@@ -661,17 +668,27 @@ async def transcribe_stream(websocket: WebSocket) -> None:
 
                 if event_type == "doc_unload":
                     active_document_id = None
+                    last_read_sentence_idx = -1
+                    resume_from_sentence_idx = None
                     continue
 
                 if event_type == "continue_reading":
                     if active_document_id and (llm_task is None or llm_task.done()):
-                        next_idx = last_read_sentence_idx + 1
                         doc = get_document_store().get_document(active_document_id)
-                        if doc and next_idx < doc.sentence_count:
-                            llm_task = asyncio.create_task(
-                                run_llm_stream(f"continue reading from sentence {next_idx}", "auto_continue")
-                            )
-                        elif doc:
+                        if doc:
+                            start_idx = _get_read_start_idx(restart_from_beginning=False)
+                            if start_idx < doc.sentence_count:
+                                llm_task = asyncio.create_task(
+                                    _run_document_read(
+                                        doc_id=doc.doc_id,
+                                        user_text="",
+                                        start_idx=start_idx,
+                                        llm_ms=0.0,
+                                    )
+                                )
+                            else:
+                                await send_json({"type": "doc_reading_pause"})
+                        else:
                             await send_json({"type": "doc_reading_pause"})
                     continue
 

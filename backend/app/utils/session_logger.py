@@ -49,13 +49,8 @@ class LLMCallLog:
     latency_ms: float
     model: str
     host: str
-    system_prompt_preview: str      # first 100 chars of system prompt
-    input_transcript: str           # full transcript sent to LLM
-    input_length_chars: int
-    output_response: str            # full response text
-    output_preview: str             # first 200 chars for quick scanning
-    output_length_chars: int
-    approx_tokens_out: int          # rough estimate: words * 1.3
+    full_prompt: str
+    output_response: str
     cancelled: bool = False
     error: str | None = None
 
@@ -63,10 +58,13 @@ class LLMCallLog:
 # ── TTS ──────────────────────────────────────────────────────────────────────
 
 @dataclass
-class TTSLog:
-    """Placeholder — TTS not yet implemented."""
-    status: str = "pending"
-    note: str = "Text-to-speech synthesis not yet implemented."
+class TTSCallLog:
+    timestamp: str
+    latency_ms: float
+    input_text: str
+    output_audio_bytes: int
+    output_sample_rate: int
+    error: str | None = None
 
 
 # ── Session ───────────────────────────────────────────────────────────────────
@@ -92,13 +90,11 @@ class SessionLog:
     # LLM config — set once at session start
     llm_model: str = ""
     llm_host: str = ""
-    llm_system_prompt_preview: str = ""
-
     # LLM runtime — one entry per inference call
     llm_calls: list[LLMCallLog] = field(default_factory=list)
 
-    # TTS — always the placeholder for now
-    tts: TTSLog = field(default_factory=TTSLog)
+    # TTS runtime
+    tts_calls: list[TTSCallLog] = field(default_factory=list)
 
     # Session-level error (WebSocket crash, etc.)
     error: str | None = None
@@ -141,7 +137,6 @@ def write_session_log(log: SessionLog) -> Path | None:
                 "config": {
                     "model": log.llm_model,
                     "host": log.llm_host,
-                    "system_prompt_preview": log.llm_system_prompt_preview,
                 },
                 "calls": [asdict(c) for c in log.llm_calls],
                 "summary": {
@@ -149,10 +144,15 @@ def write_session_log(log: SessionLog) -> Path | None:
                     "completed_calls": sum(1 for c in log.llm_calls if not c.cancelled and not c.error),
                     "cancelled_calls": sum(1 for c in log.llm_calls if c.cancelled),
                     "failed_calls": sum(1 for c in log.llm_calls if c.error),
-                    "total_tokens_approx": sum(c.approx_tokens_out for c in log.llm_calls if not c.cancelled),
                 },
             },
-            "tts": asdict(log.tts),
+            "tts": {
+                "calls": [asdict(c) for c in log.tts_calls],
+                "summary": {
+                    "total_calls": len(log.tts_calls),
+                    "failed_calls": sum(1 for c in log.tts_calls if c.error),
+                },
+            },
         },
         "error": log.error,
     }

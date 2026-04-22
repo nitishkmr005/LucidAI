@@ -7,6 +7,7 @@ from faster_whisper import WhisperModel
 from loguru import logger
 
 from app.models import DebugInfo, LatencyMetrics
+from app.utils.module_logging import log_module_io
 from config.settings import Settings, get_settings
 
 
@@ -68,6 +69,21 @@ class SpeechToTextService:
             len(segment_list),
             len(text),
             transcribe_ms,
+        )
+        log_module_io(
+            module="stt",
+            latency_ms=transcribe_ms,
+            input_payload={
+                "request_id": request_id,
+                "filename": filename,
+                "file_path": str(file_path),
+                "audio_bytes": audio_bytes,
+            },
+            output_payload={
+                "text": text,
+                "language": info.language,
+                "segments": len(segment_list),
+            },
         )
 
         return ServiceResult(

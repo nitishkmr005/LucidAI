@@ -5,11 +5,13 @@ import io
 import os
 import wave
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import numpy as np
 from loguru import logger
 
+from app.utils.module_logging import log_module_io
 from config.settings import get_settings
 
 _WARMUP_TEXT = "Hello."
@@ -108,7 +110,16 @@ class TTSService:
                     loop = asyncio.get_event_loop()
                     self._model = await loop.run_in_executor(None, self._load_model)
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._run_inference, text)
+        started_at = perf_counter()
+        wav_bytes, sample_rate = await loop.run_in_executor(None, self._run_inference, text)
+        latency_ms = round((perf_counter() - started_at) * 1000, 2)
+        log_module_io(
+            module="tts",
+            latency_ms=latency_ms,
+            input_payload={"text": text, "backend": self._backend},
+            output_payload={"audio_bytes": len(wav_bytes), "sample_rate": sample_rate},
+        )
+        return wav_bytes, sample_rate
 
 
 _tts_service: TTSService | None = None

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { Fragment, type ReactNode, useEffect, useRef, useState, useCallback } from "react";
 import { DocumentUploader } from "./document-uploader";
 import { SearchResultPopup } from "./search-result-popup";
 
@@ -55,23 +55,337 @@ type DocumentPanelProps = {
   onSelectionChange?: (docId: string | null) => void;
 };
 
+function renderInlineMarkdown(text: string, keyPrefix: string): ReactNode[] {
+  const tokens = text.split(/(`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|\*[^*]+\*|_[^_]+_|\[[^\]]+\]\([^)]+\))/g);
+
+  return tokens.filter(Boolean).map((token, index) => {
+    const key = `${keyPrefix}-${index}`;
+
+    if (/^`[^`]+`$/.test(token)) {
+      return <code key={key} className="doc-md-inline-code">{token.slice(1, -1)}</code>;
+    }
+    if (/^(\*\*|__)[\s\S]+(\*\*|__)$/.test(token)) {
+      return <strong key={key}>{token.slice(2, -2)}</strong>;
+    }
+    if (/^(\*|_)[\s\S]+(\*|_)$/.test(token)) {
+      return <em key={key}>{token.slice(1, -1)}</em>;
+    }
+
+    const linkMatch = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+    if (linkMatch) {
+      return (
+        <a key={key} href={linkMatch[2]} target="_blank" rel="noreferrer">
+          {linkMatch[1]}
+        </a>
+      );
+    }
+
+    return <Fragment key={key}>{token}</Fragment>;
+  });
+}
+
+function stripInlineMarkdown(text: string): string {
+  return text
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/(\*\*|__)(.*?)\1/g, "$2")
+    .replace(/(\*|_)(.*?)\1/g, "$2");
+}
+
+function splitLongFragment(fragment: string): string[] {
+  const normalized = fragment.replace(/\s+/g, " ").trim().replace(/^[\s\-•|]+|[\s\-•|]+$/g, "");
+  if (normalized.length <= 220) {
+    return normalized.length > 10 ? [normalized] : [];
+  }
+
+  const splitPatterns = [
+    /\s+[•|]\s+/,
+    /\s+[-–—]\s+/,
+    /:\s+(?=[A-Z])/,
+    /(?<=[a-z])\s+(?=[A-Z][a-z]{3,}\b)/,
+  ];
+
+  let pending = [normalized];
+  for (const pattern of splitPatterns) {
+    const nextPending: string[] = [];
+    let changed = false;
+    for (const item of pending) {
+      if (item.length <= 220) {
+        nextPending.push(item);
+        continue;
+      }
+      const parts = item.split(pattern).map((part) => part.trim().replace(/^[\s\-•|]+|[\s\-•|]+$/g, "")).filter((part) => part.length > 10);
+      if (parts.length > 1) {
+        nextPending.push(...parts);
+        changed = true;
+      } else {
+        nextPending.push(item);
+      }
+    }
+    pending = nextPending;
+    if (changed) break;
+  }
+
+  const finalParts: string[] = [];
+  for (const item of pending) {
+    const compact = item.replace(/\s+/g, " ").trim();
+    if (compact.length <= 240) {
+      if (compact.length > 10) finalParts.push(compact);
+      continue;
+    }
+    const words = compact.split(/\s+/);
+    let chunk: string[] = [];
+    for (const word of words) {
+      chunk.push(word);
+      const candidate = chunk.join(" ");
+      if (candidate.length >= 180 && /[,:;.]$/.test(word)) {
+        finalParts.push(candidate.trim());
+        chunk = [];
+      }
+    }
+    if (chunk.length) {
+      finalParts.push(chunk.join(" ").trim());
+    }
+  }
+
+  return finalParts;
+}
+
+function splitSpeakableSegments(text: string): string[] {
+  const plain = stripInlineMarkdown(text);
+  const rawFragments = plain.split(/(?<=[.!?])\s+|\s+[•|]\s+/);
+  const segments: string[] = [];
+  for (const fragment of rawFragments) {
+    const cleaned = fragment.trim();
+    if (cleaned.length <= 10) continue;
+    segments.push(...splitLongFragment(cleaned));
+  }
+  return segments;
+}
+
+type MarkdownRendererOptions = {
+  sentenceTexts: string[];
+  activeSentenceIdx: number | null;
+  activeWordIdx: number | null;
+  registerSentenceRef: (sentenceIdx: number, element: HTMLElement | null) => void;
+};
+
+function renderMarkdownDocument(rawMarkdown: string, options: MarkdownRendererOptions): ReactNode[] {
+  const { sentenceTexts, activeSentenceIdx, activeWordIdx, registerSentenceRef } = options;
+  const lines = rawMarkdown.replace(/\r\n/g, "\n").split("\n");
+  const nodes: ReactNode[] = [];
+  let sentenceCursor = 0;
+  let paragraphLines: string[] = [];
+  let listItems: { ordered: boolean; content: string }[] = [];
+  let quoteLines: string[] = [];
+  let codeFence: { language: string; lines: string[] } | null = null;
+
+  const renderSpeakableText = (text: string, keyPrefix: string): ReactNode[] => {
+    const segments = splitSpeakableSegments(text);
+    if (!segments.length) {
+      return renderInlineMarkdown(text, keyPrefix);
+    }
+
+    return segments.map((segment, index) => {
+      const sentenceIdx = sentenceCursor < sentenceTexts.length ? sentenceCursor : null;
+      if (sentenceIdx !== null) {
+        sentenceCursor += 1;
+      }
+      const isActive = sentenceIdx !== null && sentenceIdx === activeSentenceIdx;
+      const segmentWords = segment.split(/\s+/);
+      const key = `${keyPrefix}-segment-${index}`;
+
+      return (
+        <Fragment key={key}>
+          <span
+            ref={sentenceIdx !== null ? (element) => registerSentenceRef(sentenceIdx, element) : undefined}
+            className={isActive ? "doc-md-segment doc-md-segment--active" : "doc-md-segment"}
+            data-sentence-idx={sentenceIdx ?? undefined}
+          >
+            {isActive
+              ? segmentWords.map((word, wordIndex) => (
+                  <span
+                    key={`${key}-word-${wordIndex}`}
+                    className={activeWordIdx === wordIndex ? "doc-word--active" : undefined}
+                  >
+                    {word}
+                    {wordIndex < segmentWords.length - 1 ? " " : ""}
+                  </span>
+                ))
+              : renderInlineMarkdown(segment, `${key}-inline`)}
+          </span>
+          {index < segments.length - 1 ? " " : ""}
+        </Fragment>
+      );
+    });
+  };
+
+  const flushParagraph = () => {
+    if (!paragraphLines.length) return;
+    const text = paragraphLines.join(" ").trim();
+    if (text) {
+      nodes.push(
+        <p key={`p-${nodes.length}`} className="doc-md-paragraph">
+          {renderSpeakableText(text, `p-${nodes.length}`)}
+        </p>,
+      );
+    }
+    paragraphLines = [];
+  };
+
+  const flushList = () => {
+    if (!listItems.length) return;
+    const ordered = listItems[0].ordered;
+    const Tag = ordered ? "ol" : "ul";
+    nodes.push(
+      <Tag key={`list-${nodes.length}`} className={ordered ? "doc-md-list doc-md-list--ordered" : "doc-md-list"}>
+        {listItems.map((item, index) => (
+          <li key={`list-item-${nodes.length}-${index}`} className="doc-md-list-item">
+            {renderSpeakableText(item.content, `list-item-${nodes.length}-${index}`)}
+          </li>
+        ))}
+      </Tag>,
+    );
+    listItems = [];
+  };
+
+  const flushQuote = () => {
+    if (!quoteLines.length) return;
+    nodes.push(
+      <blockquote key={`quote-${nodes.length}`} className="doc-md-quote">
+        {quoteLines.map((line, index) => (
+          <p key={`quote-line-${nodes.length}-${index}`}>
+            {renderSpeakableText(line, `quote-line-${nodes.length}-${index}`)}
+          </p>
+        ))}
+      </blockquote>,
+    );
+    quoteLines = [];
+  };
+
+  const flushCode = () => {
+    if (!codeFence) return;
+    nodes.push(
+      <pre key={`code-${nodes.length}`} className="doc-md-code-block">
+        {codeFence.language ? <span className="doc-md-code-lang">{codeFence.language}</span> : null}
+        <code>{codeFence.lines.join("\n")}</code>
+      </pre>,
+    );
+    codeFence = null;
+  };
+
+  for (const line of lines) {
+    if (codeFence) {
+      if (line.trim().startsWith("```")) {
+        flushCode();
+      } else {
+        codeFence.lines.push(line);
+      }
+      continue;
+    }
+
+    const trimmed = line.trim();
+
+    if (!trimmed) {
+      flushParagraph();
+      flushList();
+      flushQuote();
+      continue;
+    }
+
+    const codeStart = trimmed.match(/^```(\w+)?$/);
+    if (codeStart) {
+      flushParagraph();
+      flushList();
+      flushQuote();
+      codeFence = { language: codeStart[1] ?? "", lines: [] };
+      continue;
+    }
+
+    const heading = trimmed.match(/^(#{1,6})\s+(.+)$/);
+    if (heading) {
+      flushParagraph();
+      flushList();
+      flushQuote();
+      const level = Math.min(heading[1].length, 6);
+      const content = renderSpeakableText(heading[2], `h-${nodes.length}`);
+      if (level === 1) {
+        nodes.push(<h1 key={`h-${nodes.length}`} className="doc-md-heading doc-md-heading--h1">{content}</h1>);
+      } else if (level === 2) {
+        nodes.push(<h2 key={`h-${nodes.length}`} className="doc-md-heading doc-md-heading--h2">{content}</h2>);
+      } else if (level === 3) {
+        nodes.push(<h3 key={`h-${nodes.length}`} className="doc-md-heading doc-md-heading--h3">{content}</h3>);
+      } else if (level === 4) {
+        nodes.push(<h4 key={`h-${nodes.length}`} className="doc-md-heading doc-md-heading--h4">{content}</h4>);
+      } else if (level === 5) {
+        nodes.push(<h5 key={`h-${nodes.length}`} className="doc-md-heading doc-md-heading--h5">{content}</h5>);
+      } else {
+        nodes.push(<h6 key={`h-${nodes.length}`} className="doc-md-heading doc-md-heading--h6">{content}</h6>);
+      }
+      continue;
+    }
+
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+      flushParagraph();
+      flushList();
+      flushQuote();
+      nodes.push(<hr key={`hr-${nodes.length}`} className="doc-md-rule" />);
+      continue;
+    }
+
+    const quote = trimmed.match(/^>\s?(.*)$/);
+    if (quote) {
+      flushParagraph();
+      flushList();
+      quoteLines.push(quote[1]);
+      continue;
+    }
+
+    const orderedItem = trimmed.match(/^\d+\.\s+(.+)$/);
+    if (orderedItem) {
+      flushParagraph();
+      flushQuote();
+      listItems.push({ ordered: true, content: orderedItem[1] });
+      continue;
+    }
+
+    const unorderedItem = trimmed.match(/^[-*+]\s+(.+)$/);
+    if (unorderedItem) {
+      flushParagraph();
+      flushQuote();
+      listItems.push({ ordered: false, content: unorderedItem[1] });
+      continue;
+    }
+
+    flushList();
+    flushQuote();
+    paragraphLines.push(trimmed);
+  }
+
+  flushParagraph();
+  flushList();
+  flushQuote();
+  flushCode();
+
+  return nodes;
+}
+
 export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplanation, onSelectionChange }: DocumentPanelProps) {
   const [documents, setDocuments] = useState<DocumentMeta[]>([]);
   const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [sentences, setSentences] = useState<string[]>([]);
+  const [rawMarkdown, setRawMarkdown] = useState<string>("");
   const [docTitle, setDocTitle] = useState<string>("");
   const [activeSentenceIdx, setActiveSentenceIdx] = useState<number | null>(null);
   const [activeWordIdx, setActiveWordIdx] = useState<number | null>(null);
-  const [highlights, setHighlights] = useState<Set<number>>(new Set());
   const [snippets, setSnippets] = useState<Map<number, Snippet>>(new Map());
-  const [openSnippetIdx, setOpenSnippetIdx] = useState<number | null>(null);
   const [searchQuery, setSearchQuery] = useState<string | null>(null);
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [isSearchLoading, setIsSearchLoading] = useState(false);
   const [isReading, setIsReading] = useState(false);
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const activeRowRef = useRef<HTMLParagraphElement | null>(null);
+  const sentenceRefs = useRef(new Map<number, HTMLElement | null>());
 
   const loadDocuments = useCallback(async () => {
     try {
@@ -80,11 +394,24 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
     } catch {}
   }, []);
 
+  const loadDocumentDetail = useCallback(async (docId: string) => {
+    const res = await fetch(`${backendUrl}/documents/${docId}`);
+    if (!res.ok) return null;
+    return res.json();
+  }, []);
+
   useEffect(() => { loadDocuments(); }, [loadDocuments]);
 
-  // Scroll active sentence into view
   useEffect(() => {
-    activeRowRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    sentenceRefs.current.clear();
+  }, [rawMarkdown, selectedDocId]);
+
+  useEffect(() => {
+    if (activeSentenceIdx === null) return;
+    sentenceRefs.current.get(activeSentenceIdx)?.scrollIntoView({
+      behavior: "smooth",
+      block: "center",
+    });
   }, [activeSentenceIdx]);
 
   // React to events from voice agent
@@ -101,16 +428,18 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
       setActiveSentenceIdx(null);
       setActiveWordIdx(null);
       setIsReading(true);
+      if (!rawMarkdown || selectedDocId !== event.doc_id) {
+        void loadDocumentDetail(event.doc_id).then((data) => {
+          if (!data) return;
+          setRawMarkdown(data.raw_markdown ?? "");
+        });
+      }
     } else if (event.type === "doc_opened") {
+      setRawMarkdown(event.raw_markdown);
       setSentences(event.sentences);
       setDocTitle(event.title);
       setSelectedDocId(event.doc_id);
       onSelectionChange?.(event.doc_id);
-      const hlSet = new Set<number>(event.annotations.highlights.map((h) => h.sentence_idx));
-      setHighlights(hlSet);
-      const snMap = new Map<number, Snippet>();
-      for (const sn of event.annotations.snippets) snMap.set(sn.sentence_idx, sn);
-      setSnippets(snMap);
     } else if (event.type === "doc_highlight") {
       // `doc_highlight` is emitted when the server is about to stream a sentence.
       // The actual visible reading cursor should follow playback start via
@@ -141,7 +470,7 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
       a.click();
       document.body.removeChild(a);
     }
-  }, [event, onSelectionChange]);
+  }, [event, loadDocumentDetail, onSelectionChange, rawMarkdown, selectedDocId]);
 
   // Save snippet when agent signals save
   useEffect(() => {
@@ -172,21 +501,16 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
   }, [loadDocuments]);
 
   const handleSelectDoc = useCallback(async (docId: string) => {
-    const res = await fetch(`${backendUrl}/documents/${docId}`);
-    if (!res.ok) return;
-    const data = await res.json();
+    const data = await loadDocumentDetail(docId);
+    if (!data) return;
     setSelectedDocId(docId);
     onSelectionChange?.(docId);
+    setRawMarkdown(data.raw_markdown ?? "");
     setSentences(data.sentences);
     setDocTitle(data.title);
     setActiveSentenceIdx(null);
     setActiveWordIdx(null);
-    const hlSet = new Set<number>((data.annotations?.highlights ?? []).map((h: Annotation) => h.sentence_idx));
-    setHighlights(hlSet);
-    const snMap = new Map<number, Snippet>();
-    for (const sn of (data.annotations?.snippets ?? [])) snMap.set(sn.sentence_idx, sn);
-    setSnippets(snMap);
-  }, [onSelectionChange]);
+  }, [loadDocumentDetail, onSelectionChange]);
 
   const handleDeleteDoc = useCallback(async (docId: string) => {
     await fetch(`${backendUrl}/documents/${docId}`, { method: "DELETE" });
@@ -194,19 +518,11 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
       setSelectedDocId(null);
       onSelectionChange?.(null);
       setSentences([]);
+      setRawMarkdown("");
       setDocTitle("");
     }
     await loadDocuments();
   }, [selectedDocId, loadDocuments, onSelectionChange]);
-
-  const handleHighlightSentence = useCallback((idx: number) => {
-    if (!selectedDocId) return;
-    fetch(`${backendUrl}/documents/${selectedDocId}/annotations/highlight`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sentence_idx: idx }),
-    }).then(() => setHighlights((prev) => new Set(prev).add(idx))).catch(() => {});
-  }, [selectedDocId]);
 
   const activeSentenceText =
     activeSentenceIdx !== null && activeSentenceIdx >= 0 && activeSentenceIdx < sentences.length
@@ -231,54 +547,18 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
     ));
   }, [activeWordIdx]);
 
-  const renderSentence = (sentence: string, idx: number) => {
-    const isActive = activeSentenceIdx === idx;
-    const isHighlighted = highlights.has(idx);
-    const hasSnippet = snippets.has(idx);
-
-    return (
-      <p
-        key={idx}
-        ref={isActive ? activeRowRef : null}
-        className={[
-          "doc-sentence",
-          isActive ? "doc-sentence--reading" : "",
-          isHighlighted ? "doc-sentence--highlighted" : "",
-        ].filter(Boolean).join(" ")}
-        data-sentence-idx={idx}
-      >
-        {renderWords(sentence, isActive)}
-        {" "}
-        <button
-          type="button"
-          className="doc-sentence-highlight-btn"
-          onClick={() => handleHighlightSentence(idx)}
-          title="Highlight sentence"
-          aria-label="Highlight this sentence"
-        >
-          ✦
-        </button>
-        {hasSnippet && (
-          <button
-            type="button"
-            className="doc-snippet-indicator"
-            onClick={() => setOpenSnippetIdx(openSnippetIdx === idx ? null : idx)}
-            title="View saved note"
-            aria-label="View saved note"
-          >
-            💡
-          </button>
-        )}
-        {openSnippetIdx === idx && hasSnippet && (
-          <span className="doc-snippet-tooltip">
-            <strong>{snippets.get(idx)?.term}:</strong> {snippets.get(idx)?.explanation}
-          </span>
-        )}
-      </p>
-    );
-  };
-
   const hasDocument = sentences.length > 0;
+  const registerSentenceRef = useCallback((sentenceIdx: number, element: HTMLElement | null) => {
+    sentenceRefs.current.set(sentenceIdx, element);
+  }, []);
+  const markdownNodes = rawMarkdown
+    ? renderMarkdownDocument(rawMarkdown, {
+        sentenceTexts: sentences,
+        activeSentenceIdx,
+        activeWordIdx,
+        registerSentenceRef,
+      })
+    : null;
 
   return (
     <section className="doc-panel surface">
@@ -349,8 +629,8 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
                 <p className="doc-live-text">{renderWords(activeSentenceText, true)}</p>
               </div>
             ) : null}
-            <div className="doc-sentences">
-              {sentences.map((s, i) => renderSentence(s, i))}
+            <div className="doc-markdown">
+              {markdownNodes}
             </div>
           </div>
         )}
