@@ -97,6 +97,7 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
       setSentences(event.sentences);
       setDocTitle(event.title);
       setSelectedDocId(event.doc_id);
+      onSelectionChange?.(event.doc_id);
       setActiveSentenceIdx(null);
       setActiveWordIdx(null);
       setIsReading(true);
@@ -104,14 +105,16 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
       setSentences(event.sentences);
       setDocTitle(event.title);
       setSelectedDocId(event.doc_id);
+      onSelectionChange?.(event.doc_id);
       const hlSet = new Set<number>(event.annotations.highlights.map((h) => h.sentence_idx));
       setHighlights(hlSet);
       const snMap = new Map<number, Snippet>();
       for (const sn of event.annotations.snippets) snMap.set(sn.sentence_idx, sn);
       setSnippets(snMap);
     } else if (event.type === "doc_highlight") {
-      setActiveSentenceIdx(event.sentence_idx);
-      setActiveWordIdx(null);
+      // `doc_highlight` is emitted when the server is about to stream a sentence.
+      // The actual visible reading cursor should follow playback start via
+      // `tts_word_tick` so the document doesn't jump ahead of the audio.
     } else if (event.type === "tts_word_tick") {
       setActiveSentenceIdx(event.sentence_idx);
       setActiveWordIdx(event.word_idx);
@@ -138,7 +141,7 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
       a.click();
       document.body.removeChild(a);
     }
-  }, [event]);
+  }, [event, onSelectionChange]);
 
   // Save snippet when agent signals save
   useEffect(() => {

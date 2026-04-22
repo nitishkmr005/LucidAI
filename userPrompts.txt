@@ -10,8 +10,6 @@ So, currently, you are seeing repo which does voice agent So using this voice ag
   that document along with highlighted sentence and and for a particular word, or whatever agent has searched in Internet and on some query user queries, It can you can save it in a PDF  
   or you can save it as a docx as well. This is the high level idea which I want to build. Based on this, create complete implementation plan. And save it in docs folder. 
 
-
-
      10 Name + Tagline Options                                                                                                                                   
                                                                                                                                                               
   ┌─────┬────────────┬──────────────────────────────────────────────────┐                                                                                     
@@ -38,3 +36,12 @@ So, currently, you are seeing repo which does voice agent So using this voice ag
   │ 10  │ Scriptor   │ Your voice-guided reading assistant.             │                                                        
   └─────┴────────────┴──────────────────────────────────────────────────┘                                                                                     
                                                                                
+
+I hope this is how backend is designed - 1) For any user queries, it uses LLM to answer. LLM takes all uploaded document names (just list of uploaded doc
+names) in its context always. when user clicks or selects any specific document that signal goes to LLLM context as user selected document (so llm knows
+which documents user is looking to read). When user asks to read the document from begining LLM responds with output as document to read with document name
+in json. when this name is responded by LLM, then take this name and get all data from this document name and give it tts model which keeps running in
+stream just like LLM sent data to it (FUll text of uploaded document). Never stop until user interrupts. 2) if user queries where around sepecific sections
+or words like (i didnt understand for example what do you mean by transformers) then answer those specific queries and if user says keep reading document
+then LLM should set document read flag in json and tts should keep reading where it left. 3) Text reading in document reader should be highlighted on word
+tts model is streaming voice keeping it in sync.4)If required change prompt used for LLM

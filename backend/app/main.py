@@ -254,9 +254,9 @@ async def transcribe_stream(websocket: WebSocket) -> None:
     # Minimum characters for a sentence fragment to be sent to TTS individually.
     _MIN_SENTENCE_CHARS = 15
 
-    async def _tts_sentence_pipeline(queue: asyncio.Queue[tuple[str, int | None] | None]) -> None:
+    async def _tts_sentence_pipeline(queue: asyncio.Queue[tuple[str, int | None, str | None] | None]) -> None:
         """
-        Consume sentences from *queue* and synthesise + stream each one immediately.
+        Consume queued utterances from *queue* and synthesise + stream each one immediately.
 
         Runs concurrently with the LLM token loop so the agent starts speaking
         as soon as the first sentence boundary is detected — without waiting for

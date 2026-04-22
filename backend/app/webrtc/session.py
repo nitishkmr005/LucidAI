@@ -539,7 +539,11 @@ class WebRTCSession:
 
     # ── LLM + TTS pipeline ───────────────────────────────────────────────────
 
-    async def _tts_sentence_pipeline(self, queue: asyncio.Queue, enable_barge_in: bool = True) -> None:
+    async def _tts_sentence_pipeline(
+        self,
+        queue: asyncio.Queue[tuple[str, int | None, str | None] | None],
+        enable_barge_in: bool = True,
+    ) -> None:
         """
         Consume sentences from *queue* and synthesise + stream each one immediately.
 
@@ -547,8 +551,8 @@ class WebRTCSession:
         first sentence boundary — not after the full LLM response completes.
 
         Args:
-            queue: Unbounded asyncio queue carrying ``str`` sentences or a ``None``
-                   sentinel that signals end-of-stream.
+            queue: Unbounded asyncio queue carrying ``(tts_text, sentence_idx,
+                   display_text)`` tuples or a ``None`` sentinel that signals end-of-stream.
             enable_barge_in: When ``False``, server-side VAD is not activated — used
                              for the welcome message to prevent ambient noise from
                              cancelling synthesis before the user has spoken.
