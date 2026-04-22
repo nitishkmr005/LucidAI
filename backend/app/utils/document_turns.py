@@ -110,7 +110,7 @@ def build_document_turn_context(
                 [
                     "",
                     f"Selected document: {doc.title} (id: {doc.doc_id})",
-                    f"Current reading sentence index: {last_read_sentence_idx}",
+                    "A selected document is available for reading and question answering.",
                 ]
             )
             excerpt = _pick_relevant_sentences(doc, user_text, last_read_sentence_idx)
@@ -213,3 +213,21 @@ def resolve_document_by_name(
             return store.get_document(str(doc_meta["doc_id"]))
 
     return None
+
+
+def user_explicitly_named_document(user_text: str) -> bool:
+    normalized_user_text = _normalize(user_text)
+    if not normalized_user_text:
+        return False
+
+    for doc_meta in get_document_store().list_documents():
+        candidates = [
+            _normalize(doc_meta["title"]),
+            _normalize(str(doc_meta["doc_id"])),
+            _normalize(str(doc_meta.get("filename", ""))),
+        ]
+        for candidate in candidates:
+            if candidate and candidate in normalized_user_text:
+                return True
+
+    return False

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from loguru import logger
 
-_SESSIONS_DIR = Path("logs")
+_SESSIONS_DIR = Path(__file__).resolve().parents[2] / ".cache" / "session_logs"
 
 
 def _iso() -> str:

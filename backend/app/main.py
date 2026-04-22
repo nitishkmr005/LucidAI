@@ -21,9 +21,11 @@ from app.services.stt import get_stt_service
 from app.services.tts import get_tts_service
 from app.services.vad import get_vad_service
 from app.utils.document_turns import (
+    DocumentTurnDecision,
     build_document_turn_context,
     parse_document_turn_response,
     resolve_document_by_name,
+    user_explicitly_named_document,
 )
 from app.utils.emotion import clean_for_tts
 from app.utils.session_logger import LLMCallLog, STTRunLog, SessionLog, TTSCallLog, _iso, write_session_log
@@ -38,6 +40,14 @@ _PAUSE_PATTERN = re.compile(
     r"^\s*(wait|hold on|hold up|one moment|one sec(?:ond)?|just a (?:moment|second|sec)|"
     r"give me a (?:second|moment|sec)|hang on|please wait|just wait|ok wait|okay wait|"
     r"stop|stop it|stop please|please stop|ok stop|okay stop)\s*[.!?,]?\s*$",
+    re.IGNORECASE,
+)
+_CONTINUE_READING_PATTERN = re.compile(
+    r"^\s*(keep reading|continue reading|continue|resume reading|resume)\s*[.!?,]?\s*$",
+    re.IGNORECASE,
+)
+_READ_FROM_BEGINNING_PATTERN = re.compile(
+    r"\b(read|start reading|read aloud|resume reading|continue reading)\b.*\b(beginning|start|top)\b|\bstart over\b|\brestart\b",
     re.IGNORECASE,
 )
 
@@ -452,6 +462,24 @@ async def transcribe_stream(websocket: WebSocket) -> None:
             llm_ms = round((perf_counter() - llm_t0) * 1000, 2)
             logger.info("request_id={} event=llm_done llm_ms={}", request_id, llm_ms)
             decision = parse_document_turn_response(full_response) if document_context else None
+            if active_document_id and _CONTINUE_READING_PATTERN.match(text):
+                active_doc = get_document_store().get_document(active_document_id)
+                if active_doc:
+                    decision = DocumentTurnDecision(
+                        action="continue_reading",
+                        document_name=active_doc.title,
+                        response_text="",
+                        restart_from_beginning=False,
+                    )
+            elif active_document_id and _READ_FROM_BEGINNING_PATTERN.search(text):
+                active_doc = get_document_store().get_document(active_document_id)
+                if active_doc:
+                    decision = DocumentTurnDecision(
+                        action="read_document",
+                        document_name=active_doc.title,
+                        response_text="",
+                        restart_from_beginning=True,
+                    )
 
             if decision is not None:
                 if decision.action == "list_documents":
@@ -488,12 +516,8 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                     )
                     display_response = response_text
                 elif decision.action in {"read_document", "continue_reading"}:
-                    target_doc = resolve_document_by_name(
-                        decision.document_name,
-                        active_document_id=active_document_id,
-                    )
-                    if target_doc is None:
-                        response_text = "I couldn't tell which document to read. Which one do you want?"
+                    if decision.action == "read_document" and not user_explicitly_named_document(text):
+                        response_text = "Which document should I read?"
                         await _play_tts_turn(
                             user_text=text,
                             display_text=response_text,
@@ -502,17 +526,31 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                         )
                         display_response = response_text
                     else:
-                        if decision.restart_from_beginning:
-                            last_read_sentence_idx = -1
-                            resume_from_sentence_idx = None
-                        elif decision.action == "continue_reading" and resume_from_sentence_idx is None and last_read_sentence_idx < 0:
-                            resume_from_sentence_idx = 0
-                        display_response = await _run_document_read(
-                            doc_id=target_doc.doc_id,
-                            user_text=text,
-                            start_idx=_get_read_start_idx(restart_from_beginning=decision.restart_from_beginning),
-                            llm_ms=llm_ms,
+                        target_doc = resolve_document_by_name(
+                            decision.document_name,
+                            active_document_id=active_document_id if decision.action == "continue_reading" else None,
                         )
+                        if target_doc is None:
+                            response_text = "I couldn't tell which document to read. Which one do you want?"
+                            await _play_tts_turn(
+                                user_text=text,
+                                display_text=response_text,
+                                utterances=_split_text_for_tts(response_text),
+                                llm_ms=llm_ms,
+                            )
+                            display_response = response_text
+                        else:
+                            if decision.restart_from_beginning:
+                                last_read_sentence_idx = -1
+                                resume_from_sentence_idx = None
+                            elif decision.action == "continue_reading" and resume_from_sentence_idx is None and last_read_sentence_idx < 0:
+                                resume_from_sentence_idx = 0
+                            display_response = await _run_document_read(
+                                doc_id=target_doc.doc_id,
+                                user_text=text,
+                                start_idx=_get_read_start_idx(restart_from_beginning=decision.restart_from_beginning),
+                                llm_ms=llm_ms,
+                            )
                 else:
                     response_text = decision.response_text or "I'm not sure how to help with that yet."
                     await _play_tts_turn(

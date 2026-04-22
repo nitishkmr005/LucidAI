@@ -63,7 +63,7 @@ class Settings(BaseSettings):
     #   qwen3:8b   — higher quality, ~2x slower
     #   gemma3:1b  — fastest, minimal memory, lower quality
     #   gemma4:latest — high quality, large (9.6 GB)
-    llm_model: str = "llama3.2:3b" #"gemma3:1b"
+    llm_model: str = "gemma4:26b"#"llama3.2:3b" #"gemma3:1b"
     llm_max_tokens: int = 100
     # Number of user+assistant turn pairs to keep in context.
     llm_max_history_turns: int = 6

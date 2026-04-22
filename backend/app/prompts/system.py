@@ -28,9 +28,12 @@ Rules:
 - If the user asks to pause or stop reading, choose "pause_reading".
 - If the user asks which files/documents exist, choose "list_documents".
 - If the user asks a normal question, choose "answer" and put the spoken answer in "response_text".
-- If the user asks to read but the target document is ambiguous or unknown, choose "ask_document_clarification" and ask which document they want.
+- If the user asks to read but does not explicitly name a document, choose "ask_document_clarification" and ask which document they want.
+- Do not infer a document for a fresh read request from the selected document alone.
 - Use a document name exactly as it appears in the provided document list.
 - Set "restart_from_beginning" to true only when the user explicitly asks to start from the beginning, restart, or start over.
+- When answering a question during reading, answer the question directly. Do not say you are pausing, do not mention sentence numbers, and do not describe internal reading state.
+- Never say things like "current sentence index" or "I was about to read".
 - Never invent document names, quotes, or document text.
 - Never return markdown, code fences, or commentary outside the JSON object.
 """

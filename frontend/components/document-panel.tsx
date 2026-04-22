@@ -92,6 +92,13 @@ function stripInlineMarkdown(text: string): string {
     .replace(/(\*|_)(.*?)\1/g, "$2");
 }
 
+function normalizeForSentenceMatch(text: string): string {
+  return stripInlineMarkdown(text)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
 function splitLongFragment(fragment: string): string[] {
   const normalized = fragment.replace(/\s+/g, " ").trim().replace(/^[\s\-•|]+|[\s\-•|]+$/g, "");
   if (normalized.length <= 220) {
@@ -181,18 +188,44 @@ function renderMarkdownDocument(rawMarkdown: string, options: MarkdownRendererOp
   let codeFence: { language: string; lines: string[] } | null = null;
 
   const renderSpeakableText = (text: string, keyPrefix: string): ReactNode[] => {
-    const segments = splitSpeakableSegments(text);
+    const normalizedBlock = normalizeForSentenceMatch(text);
+    const matchedSegments: { sentenceIdx: number; text: string }[] = [];
+    let matchCursor = 0;
+    let probe = sentenceCursor;
+
+    while (probe < sentenceTexts.length) {
+      const candidate = sentenceTexts[probe];
+      const normalizedCandidate = normalizeForSentenceMatch(candidate);
+      if (!normalizedCandidate) {
+        probe += 1;
+        continue;
+      }
+      const foundAt = normalizedBlock.indexOf(normalizedCandidate, matchCursor);
+      if (foundAt === -1) {
+        break;
+      }
+      matchedSegments.push({ sentenceIdx: probe, text: candidate });
+      matchCursor = foundAt + normalizedCandidate.length;
+      probe += 1;
+    }
+
+    const segments = matchedSegments.length
+      ? matchedSegments
+      : splitSpeakableSegments(text).map((segment, index) => ({
+          sentenceIdx: sentenceCursor + index,
+          text: segment,
+        }));
+
     if (!segments.length) {
       return renderInlineMarkdown(text, keyPrefix);
     }
 
+    sentenceCursor += matchedSegments.length || segments.length;
+
     return segments.map((segment, index) => {
-      const sentenceIdx = sentenceCursor < sentenceTexts.length ? sentenceCursor : null;
-      if (sentenceIdx !== null) {
-        sentenceCursor += 1;
-      }
+      const sentenceIdx = segment.sentenceIdx < sentenceTexts.length ? segment.sentenceIdx : null;
       const isActive = sentenceIdx !== null && sentenceIdx === activeSentenceIdx;
-      const segmentWords = segment.split(/\s+/);
+      const segmentWords = segment.text.split(/\s+/);
       const key = `${keyPrefix}-segment-${index}`;
 
       return (
@@ -212,7 +245,7 @@ function renderMarkdownDocument(rawMarkdown: string, options: MarkdownRendererOp
                     {wordIndex < segmentWords.length - 1 ? " " : ""}
                   </span>
                 ))
-              : renderInlineMarkdown(segment, `${key}-inline`)}
+              : segment.text}
           </span>
           {index < segments.length - 1 ? " " : ""}
         </Fragment>
