@@ -1,0 +1,581 @@
+# Docent: End-to-End Audio Pipeline
+
+This article explains every step Docent takes from the moment sound hits your microphone to the moment you hear the agent's reply — and how interruption is handled in between. The two directions are covered separately: **client → server** (your voice going in) and **server → client** (the agent's voice coming back).
+
+---
+
+## The shape of the system
+
+```
+Browser                               Server (FastAPI + aiortc)
+──────────────────────────────────    ────────────────────────────────────
+Mic hardware
+  └─ getUserMedia (browser API)
+       ├─ echo cancellation
+       ├─ noise suppression
+       └─ auto-gain control
+            │
+            ▼
+     MediaStreamTrack (PCM)
+            │
+     RTCPeerConnection
+            │ Opus encode → RTP frames
+            │ DTLS-SRTP over UDP
+            ▼
+                                      aiortc DTLS stack
+                                        └─ SRTP decrypt → RTP demux
+                                             └─ Opus decode (libav)
+                                                  └─ av.AudioResampler
+                                                       └─ PCM 16 kHz buffer
+                                                            │
+                                               Streaming Silero VAD
+                                              (RMS fallback if disabled)
+                                                            │
+                                                      faster-whisper STT
+                                                            │
+                                                       Ollama LLM
+                                                    (sentence streaming)
+                                                            │
+                                                        TTS synthesis
+                                                     (per sentence, async)
+                                                            │
+            RTCDataChannel ◄────── JSON tts_audio chunks ──┘
+            │ (base64 WAV)
+            ▼
+     AudioContext.decodeAudioData
+            └─ TTS audio queue
+                 └─ sequential playback
+```
+
+Docent also supports a **WebSocket** transport. In that mode, the browser sends raw Float32 PCM over binary WebSocket frames instead of RTP/WebRTC. The server-side pipeline from STT onward is identical, and the same JSON message schema is used for the return direction. The rest of this article focuses on the WebRTC path, which is the default.
+
+---
+
+## Part 1: Client → Server
+
+### Step 1 — Microphone capture and browser audio processing
+
+Everything starts with a single browser API call:
+
+```typescript
+const stream = await navigator.mediaDevices.getUserMedia({
+  audio: {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+  },
+});
+```
+
+These three constraints activate the browser's built-in audio processing stack. They run before any application code sees the signal, inside the browser's audio engine (Chrome uses WebRTC's `audio_processing` module; Safari uses CoreAudio).
+
+**Echo cancellation (AEC)** removes the agent's own voice from the mic signal. Without it, if your speakers are loud, the mic would pick up the TTS output and the STT would transcribe the agent talking to itself. AEC works by keeping a reference copy of the audio being played out and subtracting it (adaptively) from the mic input. The subtraction is adaptive because speaker position, room reflections, and volume change continuously.
+
+**Noise suppression (NS)** attenuates stationary background noise — fans, keyboard clicks, HVAC rumble. It uses a spectral subtraction approach: estimate which frequency bands are consistently noisy and reduce them on every frame.
+
+**Auto-gain control (AGC)** normalises the microphone level so whispered and loud speech produce similar amplitude at the output. It applies a slowly adjusting gain so the STT model always sees audio in the amplitude range it was trained on.
+
+The result is a `MediaStream` containing a `MediaStreamTrack` of clean, normalised mono audio ready for encoding.
+
+---
+
+### Step 2 — WebRTC peer connection setup and SDP negotiation
+
+The frontend creates an `RTCPeerConnection`, adds the mic track, and opens a data channel for signalling:
+
+```typescript
+// frontend/components/webrtc-transport.ts
+const pc = new RTCPeerConnection({ iceServers: STUN_SERVERS });
+for (const track of stream.getAudioTracks()) {
+  pc.addTrack(track, stream);
+}
+const dc = pc.createDataChannel("signaling", { ordered: true });
+```
+
+Adding the audio track triggers the browser's codec negotiation machinery. The browser announces in its SDP offer that it can send audio using **Opus** (it may offer other codecs too, but aiortc on the server negotiates Opus).
+
+**SDP (Session Description Protocol)** is a text format that describes the session: what codecs are available, what network addresses to try, what encryption keys to use. The browser generates an SDP offer and the server responds with an SDP answer. Together they agree on exactly one codec, one set of ICE candidates, and one DTLS certificate fingerprint before any media flows.
+
+Docent uses **vanilla ICE** (all candidates gathered before the offer is sent):
+
+```typescript
+// Wait for all ICE candidates to be embedded in the local SDP
+await this._waitForIceGathering(4000);
+// Then POST the complete offer
+const resp = await fetch(`${backendUrl}/webrtc/offer`, {
+  method: "POST",
+  body: JSON.stringify({ sdp: pc.localDescription!.sdp, type: "offer" }),
+});
+```
+
+Gathering all candidates first means the server receives a self-contained offer SDP with every candidate already embedded. No trickle-ICE endpoint is needed. The server completes SDP exchange in one HTTP round-trip.
+
+On the server side, `POST /webrtc/offer` creates a `WebRTCSession` and returns the answer:
+
+```python
+# backend/app/webrtc/router.py
+session = WebRTCSession(session_id)
+answer = await session.setup(body.sdp, body.type)
+# answer.sdp is sent back to the browser
+```
+
+```python
+# backend/app/webrtc/session.py
+async def setup(self, offer_sdp: str, offer_type: str) -> RTCSessionDescription:
+    await self.pc.setRemoteDescription(RTCSessionDescription(sdp=offer_sdp, type=offer_type))
+    answer = await self.pc.createAnswer()
+    await self.pc.setLocalDescription(answer)
+    return self.pc.localDescription
+```
+
+After the browser sets the answer as its remote description, both sides start the ICE connectivity checks and DTLS handshake.
+
+Once the RTC data channel opens, the server immediately sends a `ready` event and can optionally stream a spoken `WELCOME_MESSAGE`. That welcome greeting uses the same sentence-streamed TTS path as normal assistant replies, but barge-in is temporarily disabled for that first turn so ambient noise does not cancel it before the user speaks.
+
+---
+
+### Step 3 — ICE connectivity checks and NAT traversal
+
+**ICE (Interactive Connectivity Establishment)** is the protocol that finds a working network path between the browser and the server. Both sides gather **candidates** — possible addresses where they can be reached:
+
+- **Host candidates**: local LAN addresses (e.g. `192.168.1.5:50000`)
+- **Server-reflexive (srflx) candidates**: the public address seen by a STUN server (tells you what address the NAT gateway maps you to)
+- **Relay candidates**: addresses on a TURN relay server (fallback when direct paths fail)
+
+Docent uses STUN for srflx discovery (`stun.l.google.com:19302`). For localhost and simple NAT environments, host candidates usually succeed directly.
+
+ICE connectivity checks are STUN binding requests sent on every candidate pair. Once a request and its response arrive successfully, that pair is usable. ICE selects the highest-priority working pair as the nominated path.
+
+For most developer setups (browser and backend on the same machine or same LAN), ICE completes in milliseconds via a host candidate pair. No STUN request ever leaves the local network.
+
+---
+
+### Step 4 — DTLS handshake and SRTP keying
+
+UDP is unreliable and unencrypted by default. WebRTC mandates encryption on all media. The mechanism is **DTLS-SRTP**:
+
+1. **DTLS (Datagram TLS)**: a TLS handshake run over UDP. Each side proves its identity using the certificate fingerprint embedded in the SDP. The handshake produces a shared secret.
+2. **SRTP (Secure RTP)**: the shared secret from DTLS is used to derive keys for encrypting and authenticating RTP packets. Media is never sent in the clear.
+
+aiortc handles the DTLS stack entirely on the Python side. From the application's perspective, audio frames arrive already decrypted as `av.AudioFrame` objects.
+
+---
+
+### Step 5 — Opus encoding and RTP framing (browser side)
+
+Once ICE and DTLS complete, the browser starts sending audio. The processing chain is:
+
+```
+MediaStreamTrack (Float32, 48 kHz, AEC/NS/AGC applied)
+    └─ Browser Opus encoder
+         └─ Opus compressed frame (~20 ms, variable bitrate)
+              └─ RTP packet (RFC 3550)
+                   └─ DTLS-SRTP encryption
+                        └─ UDP datagram → network
+```
+
+**Opus** is a lossy audio codec designed for real-time communication. Key properties:
+
+- Variable bitrate, typically 6–128 kbps (WebRTC defaults to ~32 kbps for mono speech)
+- 20 ms frames by default (960 samples at 48 kHz per frame)
+- Built-in voice activity detection and discontinuous transmission (DTX) — silent frames generate minimal data
+- Surpasses older speech codecs (G.711, G.729) in quality at the same bitrate
+
+**RTP (Real-time Transport Protocol, RFC 3550)** is the standard envelope for media over UDP. Each RTP packet carries:
+
+- **SSRC (Synchronization Source)**: 32-bit random ID identifying this stream
+- **Sequence number**: 16-bit counter, increments per packet; receiver uses this to detect loss and reorder out-of-order packets
+- **Timestamp**: 32-bit media clock; for Opus at 48 kHz, advances by 960 per 20 ms frame; receiver uses this for jitter correction and lip sync
+- **Payload type**: identifies the codec (Opus is negotiated dynamically during SDP)
+- **Payload**: the Opus-compressed audio data
+
+RTP itself does not guarantee delivery or ordering — that is UDP's responsibility (which is: none). The receiver handles loss gracefully by letting the codec do concealment on missing frames.
+
+---
+
+### Step 6 — Server receives and decodes RTP
+
+aiortc's DTLS/ICE stack accepts the incoming UDP datagrams, decrypts SRTP, and surfaces `av.AudioFrame` objects to Python code via the `on("track")` callback:
+
+```python
+# backend/app/webrtc/session.py
+@self.pc.on("track")
+def on_track(track: MediaStreamTrack) -> None:
+    if track.kind == "audio":
+        self._audio_task = asyncio.ensure_future(self._consume_audio(track))
+```
+
+The `_consume_audio` coroutine loops on `track.recv()`, which returns one decoded `av.AudioFrame` per call — already Opus-decoded by libav (PyAV) into PCM samples at 48 kHz.
+
+The server then resamples from 48 kHz to 16 kHz because faster-whisper (and all Whisper checkpoints) expect 16 kHz mono audio:
+
+```python
+resampler = av.AudioResampler(format="s16", layout="mono", rate=16_000)
+
+while not self._closed:
+    frame = await asyncio.wait_for(track.recv(), timeout=5.0)
+    for resampled in resampler.resample(frame):
+        pcm = resampled.to_ndarray().tobytes()
+        self._pcm_buffer.extend(pcm)
+```
+
+`av.AudioResampler` uses libswresample under the hood (part of FFmpeg). It converts the sample format from the codec's float planar to signed 16-bit interleaved, and downsamples the rate using a polyphase filter bank.
+
+The result stored in `_pcm_buffer` is raw **PCM16 mono at 16 kHz** — two bytes per sample, signed little-endian, no header. This is the native input format faster-whisper expects.
+
+---
+
+### Step 7 — Streaming Silero VAD for endpointing and barge-in
+
+After resampling, the WebRTC pipeline feeds every PCM16 chunk into a dedicated streaming `Silero VAD` instance:
+
+```python
+for vad_event in self._vad_stream.process_pcm16(pcm):
+    if vad_event.event == "start":
+        if self._is_agent_speaking:
+            asyncio.ensure_future(self._handle_interrupt())
+    elif vad_event.event == "end":
+        if not self._is_agent_speaking:
+            self._schedule_speech_finalization("vad_end")
+```
+
+Internally, that stream keeps a small rolling buffer and runs the Silero model on `512`-sample frames at `16 kHz`:
+
+```python
+speech_prob = float(self._model(frame_tensor, 16_000).item())
+if speech_prob >= threshold and not triggered:
+    events.append(VADStreamEvent(event="start", ...))
+elif speech_prob < neg_threshold and triggered:
+    if current_sample - temp_end >= min_silence_samples:
+        events.append(VADStreamEvent(event="end", ...))
+```
+
+The important tuning knobs are:
+
+- `STREAM_VAD_THRESHOLD=0.4`
+- `STREAM_VAD_MIN_SILENCE_MS=600`
+- `STREAM_VAD_SPEECH_PAD_MS=200`
+- `STREAM_VAD_FRAME_SAMPLES=512`
+
+This VAD does two jobs at once:
+
+- it detects **speech start** quickly enough to interrupt assistant playback when the user barges in
+- it detects **speech end** so the turn can be finalized before waiting on a full fallback timeout
+
+If dedicated VAD is disabled, the server falls back to a simpler RMS gate only for barge-in while the agent is speaking. That fallback is intentionally narrower; it does not drive the full speech-start/speech-end endpointing logic.
+
+---
+
+### Step 8 — STT with faster-whisper
+
+Once enough audio has accumulated, the server writes the PCM buffer to a temporary WAV file and runs faster-whisper:
+
+```python
+def _transcribe_buffer(self) -> dict:
+    with wave.open(str(temp_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(self._sample_rate)
+        wf.writeframes(bytes(self._pcm_buffer))
+
+    service = get_stt_service()
+    result = service.transcribe(file_path=temp_path, ...)
+```
+
+This runs in a thread pool executor (`loop.run_in_executor`) so the asyncio event loop stays responsive to incoming RTP frames and interrupt signals during the synchronous whisper inference call.
+
+**Why write a WAV instead of streaming to the model?**
+
+Whisper is not a streaming model. It was trained on fixed-length mel spectrograms (30-second windows). `faster-whisper` exposes a `transcribe()` function that takes a file path or audio array. Writing a WAV and re-running transcription on a growing buffer is the standard streaming pattern for Whisper: the same audio is re-transcribed each time more speech arrives, producing progressively longer and more accurate partial results.
+
+The emission is rate-limited to avoid redundant inference:
+
+```python
+should_emit = (
+    buffered_ms >= settings.stream_min_audio_ms        # 300 ms minimum
+    and (now - last_emit_at) * 1000 >= settings.stream_emit_interval_ms  # 250 ms gap
+)
+```
+
+When the transcript changes, a `partial` message is sent over the data channel and a silence debounce timer is (re)started.
+
+**faster-whisper** runs the Whisper model through CTranslate2 — a C++ inference engine that supports int8 quantisation on CPU. The default configuration is `small` model, `int8` compute type, `beam_size=1` (greedy decoding), with `vad_filter=True` to strip silence before feeding to the model.
+
+---
+
+### Step 9 — VAD endpointing with silence-debounce fallback
+
+Partial transcripts are still emitted on a timer, but they are no longer the only trigger for turn completion. In the WebRTC path, `Silero VAD` is the primary endpointing signal and the debounce timer is the safety net:
+
+```python
+async def _silence_debounce_then_fire(self, text: str, trigger: str) -> None:
+    try:
+        await asyncio.sleep(self._settings.stream_llm_silence_ms / 1000)
+    except asyncio.CancelledError:
+        return
+    if self._vad_stream is not None:
+        self._schedule_speech_finalization(trigger)
+        return
+    self._schedule_llm(text, trigger)
+```
+
+The sequence is:
+
+1. partial STT changes restart the fallback debounce timer
+2. if `vad_speech_end` arrives first, the server finalizes the turn immediately
+3. if VAD end does not arrive cleanly, the debounce fallback finalizes the buffered speech anyway
+4. only then is the LLM scheduled, subject to guards like `STREAM_LLM_MIN_CHARS`
+
+This hybrid approach matters in practice. Whisper partials are useful, but they are not reliable enough on their own to decide turn boundaries, and VAD alone can still miss some edges. Combining both avoids duplicate turns and reduces "assistant replied before I finished" failures.
+
+---
+
+## Part 2: Server → Client
+
+### Step 10 — LLM inference (Ollama, streaming)
+
+The LLM call streams tokens as they are generated:
+
+```python
+async for token in stream_llm_response(text, conversation_history=history):
+    if self._interrupt_event.is_set():
+        break
+    full_response += token
+    await self._send_json({"type": "llm_partial", "text": full_response})
+    # Check for sentence boundary and enqueue for TTS
+    tail = full_response[processed_chars:]
+    m = _SENT_BOUNDARY.search(tail)  # looks for . ! ?
+    if m and m.end() >= _MIN_SENTENCE_CHARS:  # 15 chars minimum
+        sentence = clean_for_tts(tail[:m.end()].strip())
+        await sent_queue.put(sentence)
+        processed_chars += m.end()
+```
+
+Every token is immediately sent to the frontend as an `llm_partial` message so the transcript panel updates in real time. Simultaneously, the code scans for sentence boundaries. When a complete sentence is detected, it is pushed into an asyncio queue.
+
+---
+
+### Step 11 — Sentence-streaming TTS pipeline
+
+A `_tts_sentence_pipeline` coroutine runs concurrently with the LLM loop, consuming sentences from the queue as soon as they appear:
+
+```python
+async def _tts_sentence_pipeline(self, queue: asyncio.Queue) -> None:
+    self._is_agent_speaking = True
+    while True:
+        sentence = await queue.get()
+        if sentence is None or self._interrupt_event.is_set():
+            break
+        wav_bytes, sr = await tts_service.synthesize(sentence)
+        if self._interrupt_event.is_set():
+            break
+        wav_b64 = base64.b64encode(wav_bytes).decode()
+        await self._send_json({
+            "type": "tts_audio",
+            "data": wav_b64,
+            "sample_rate": sr,
+            "sentence_text": sentence,
+        })
+    self._is_agent_speaking = False
+    if self._interrupt_event.is_set():
+        await self._send_json({"type": "tts_interrupted"})
+    else:
+        await self._send_json({"type": "tts_done"})
+```
+
+This is why the agent starts speaking before the full LLM response is done. By the time the LLM finishes its second sentence, the TTS of the first sentence is already playing in the browser.
+
+**TTS synthesis** (Kokoro or Chatterbox) takes a text string and returns WAV bytes at 24 kHz. Kokoro uses the `mlx-audio` MLX inference engine on Apple Silicon. The output is a `numpy` float32 waveform converted to signed 16-bit PCM:
+
+```python
+samples = np.asarray(final_audio).squeeze()
+pcm16 = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+```
+
+That byte array is base64-encoded and sent as the `data` field of a `tts_audio` message.
+
+---
+
+### Step 12 — RTCDataChannel delivery
+
+`tts_audio` messages — along with all other signalling (`ready`, `partial`, `llm_start`, `llm_partial`, `llm_final`, `tts_start`, `tts_done`, `tts_interrupted`) — travel over the `RTCDataChannel` named `"signaling"`.
+
+The data channel was created by the browser with `ordered: true`. This means:
+
+- Messages are delivered in the order they were sent (no out-of-order delivery)
+- The channel internally uses SCTP over DTLS-SRTP over UDP — the same encrypted UDP connection as the media path
+- Retransmission is automatic for lost messages (unlike the audio RTP stream, which tolerates loss)
+
+Because the channel is ordered, the sequence `tts_start → tts_audio(sentence1) → tts_audio(sentence2) → tts_done` always arrives in that order on the browser.
+
+---
+
+### Step 13 — Frontend audio queue and playback
+
+The browser receives each `tts_audio` message, decodes it, and adds it to a queue:
+
+```typescript
+// tts_audio handler
+const binary = Uint8Array.from(atob(msg.data!), c => c.charCodeAt(0));
+const audioBuffer = await audioCtxRef.current.decodeAudioData(binary.buffer);
+ttsQueueRef.current.push({ buffer: audioBuffer, text: msg.sentence_text ?? "" });
+if (!isTtsPlayingRef.current) playNextTtsChunk();
+```
+
+`AudioContext.decodeAudioData` decodes the WAV (including header parsing and PCM decoding) into an `AudioBuffer` — the browser's in-memory audio representation optimised for low-latency playback.
+
+Playback is strictly sequential via `playNextTtsChunk`:
+
+```typescript
+const playNextTtsChunk = useCallback(() => {
+  const chunk = ttsQueueRef.current.shift();
+  if (!chunk) {
+    isTtsPlayingRef.current = false;
+    return;
+  }
+  isTtsPlayingRef.current = true;
+  const source = audioCtxRef.current.createBufferSource();
+  source.buffer = chunk.buffer;
+  source.connect(audioCtxRef.current.destination);
+  source.onended = () => {
+    revealedTextRef.current += chunk.text + " ";
+    playNextTtsChunk();  // play next sentence when this one finishes
+  };
+  source.start();
+}, []);
+```
+
+Each sentence is played to completion before the next begins. The `sentence_text` field is used to reveal the transcript word-group by word-group as the agent speaks, rather than dumping the full response at once.
+
+---
+
+## Interrupt handling: the full path
+
+Interrupt is a coordinated cancel signal that must stop the pipeline at every stage simultaneously.
+
+### Client-side detection
+
+The browser's `ScriptProcessorNode` (2048 sample buffer) runs on every audio chunk. During agent speech, it measures energy:
+
+```typescript
+const rms = Math.sqrt(samples.reduce((s, v) => s + v * v, 0) / samples.length);
+if (rms > BARGE_IN_THRESHOLD) bargeInFrameCount++;
+if (bargeInFrameCount >= BARGE_IN_FRAMES) {  // 1 frame required
+    clearTtsQueue();      // stop playback immediately
+    transport.send({ type: "interrupt" });
+}
+```
+
+`clearTtsQueue()` stops the currently playing `AudioBufferSourceNode`, clears the pending queue, and resets all playback refs. This is synchronous — the audio stops in the same JS microtask.
+
+The `interrupt` message is also sent via the data channel so the server can cancel its LLM/TTS work.
+
+### Server-side VAD (concurrent path)
+
+As described in Step 7, the server-side path uses dedicated `Silero VAD` on the decoded RTP frames. A `speech_start` event while `_is_agent_speaking` is true is treated as barge-in and triggers `_handle_interrupt()` without waiting for a browser round-trip. If streaming VAD is disabled, the code falls back to a simpler RMS gate for this path.
+
+### Interrupt handler (server)
+
+```python
+async def _handle_interrupt(self) -> None:
+    self._interrupt_event.set()          # signals all loops to stop
+    self._is_agent_speaking = False
+    self._pcm_buffer.clear()
+    if self._llm_task and not self._llm_task.done():
+        self._llm_task.cancel()           # fire-and-forget — no await
+        self._llm_task = None
+```
+
+The real handler also cancels pending TTS, clears silence-debounce/finalization tasks, resets the VAD stream state, and drops buffered audio so the next user utterance starts from a clean slate. `cancel()` is still fire-and-forget: the LLM loop and TTS pipeline both observe the interrupt event and exit on their next awaited boundary.
+
+When `_tts_sentence_pipeline` exits due to the interrupt event, it sends `tts_interrupted`:
+
+```python
+if self._interrupt_event.is_set():
+    await self._send_json({"type": "tts_interrupted"})
+```
+
+The frontend handles this by clearing any remaining queue items and transitioning back to listening mode:
+
+```typescript
+case "tts_interrupted":
+    clearTtsQueue();
+    startTransition(() => setMode("listening"));
+    break;
+```
+
+After the interrupt, `_pcm_buffer` is cleared and the session is ready for the next user turn. The interrupt event itself is cleared at the start of `_run_llm` when the next LLM call begins.
+
+---
+
+## Timing: where latency comes from
+
+| Stage | Typical time | Notes |
+|-------|-------------|-------|
+| Mic → UDP delivery | ~1–5 ms | Loopback/LAN; dominated by OS audio buffer |
+| ICE + DTLS setup | ~50–200 ms | One-time per session |
+| STT (first partial) | ~300–600 ms | Depends on buffer fill time and model size |
+| VAD speech-end decision | ~600 ms silence | Default `STREAM_VAD_MIN_SILENCE_MS` |
+| Debounce fallback | 950 ms | Used when VAD endpointing does not fire cleanly |
+| LLM first token | ~100–500 ms | Depends on model and hardware |
+| LLM first sentence boundary | ~300–1000 ms | Depends on response style and model |
+| TTS synthesis (one sentence) | ~100–400 ms | Kokoro MLX on Apple Silicon |
+| DataChannel → AudioContext | ~5–20 ms | JSON parse + WAV decode |
+| **Total (first speech heard)** | **~1.3–3 s** | From end of user utterance |
+
+The sentence-streaming pipeline overlaps TTS synthesis with LLM generation. By the time sentence 2 is ready from the LLM, sentence 1 is already playing. The user hears the reply start well before the full LLM response is complete.
+
+---
+
+## Why the sequence matters
+
+The design choices are interconnected:
+
+- **WebRTC + Opus** provides compressed, low-latency audio with browser-native echo cancellation — the single most important preprocessing step for a hands-free agent
+- **RTP over UDP** lets media arrive with minimal buffering; a dropped packet is a small audio artifact, not a stall
+- **RTCDataChannel** reuses the same encrypted UDP path as the media, so signalling messages have the same low-latency properties as the audio
+- **Dedicated streaming Silero VAD** gives the server a real speech-start/speech-end signal instead of guessing only from transcript pauses
+- **Debounce fallback** keeps the turn moving even when VAD end does not fire cleanly on a noisy or clipped utterance
+- **Sentence-streaming TTS** means the agent starts speaking ~1 sentence of LLM time after you finish talking, not one full LLM response time
+- **Welcome-message streaming** reuses the same TTS/audio queue path as normal replies, which keeps the first-turn UX consistent
+- **asyncio + executor** keeps the event loop responsive to interrupt signals even while the synchronous STT inference is running
+
+The result is not one model doing everything — it is five stages (AEC, STT, LLM, TTS, playback) each doing one job well, stitched together with careful async orchestration so the handoffs feel invisible.
+
+---
+
+## Sources
+
+### Repo files
+
+- [`backend/app/webrtc/session.py`](../backend/app/webrtc/session.py)
+- [`backend/app/webrtc/router.py`](../backend/app/webrtc/router.py)
+- [`backend/app/main.py`](../backend/app/main.py)
+- [`backend/app/services/stt.py`](../backend/app/services/stt.py)
+- [`backend/app/services/llm.py`](../backend/app/services/llm.py)
+- [`backend/app/services/tts.py`](../backend/app/services/tts.py)
+- [`backend/config/settings.py`](../backend/config/settings.py)
+- [`frontend/components/webrtc-transport.ts`](../frontend/components/webrtc-transport.ts)
+- [`frontend/components/voice-agent-console.tsx`](../frontend/components/voice-agent-console.tsx)
+- [`backend/pyproject.toml`](../backend/pyproject.toml)
+
+### External references
+
+- IETF RFC 3550, "RTP: A Transport Protocol for Real-Time Applications": https://www.rfc-editor.org/rfc/rfc3550
+- IETF RFC 3711, "The Secure Real-time Transport Protocol (SRTP)": https://www.rfc-editor.org/rfc/rfc3711
+- IETF RFC 5245, "Interactive Connectivity Establishment (ICE)": https://www.rfc-editor.org/rfc/rfc5245
+- IETF RFC 6347, "Datagram Transport Layer Security Version 1.2 (DTLS)": https://www.rfc-editor.org/rfc/rfc6347
+- Opus codec specification: https://opus-codec.org/
+- W3C WebRTC 1.0 API: https://www.w3.org/TR/webrtc/
+- W3C Media Capture and Streams: https://www.w3.org/TR/mediacapture-streams/
+- aiortc documentation: https://aiortc.readthedocs.io/
+- PyAV documentation: https://pyav.org/docs/
+- OpenAI, "Robust Speech Recognition via Large-Scale Weak Supervision" (Whisper): https://arxiv.org/abs/2212.04356
+- SYSTRAN, `faster-whisper` README: https://github.com/SYSTRAN/faster-whisper
+- Google, Gemma 3 model card: https://ai.google.dev/gemma/docs/core/model_card_3
+- Ollama API docs: https://docs.ollama.com/api
+- hexgrad, Kokoro model card: https://huggingface.co/hexgrad/Kokoro-82M
+- MLX Community, Kokoro MLX model card: https://huggingface.co/mlx-community/Kokoro-82M-bf16
+- Resemble AI, Chatterbox repository: https://github.com/resemble-ai/chatterbox
+- Qwen Team, "Qwen3-TTS Technical Report": https://arxiv.org/abs/2601.15621
+- Microsoft, VibeVoice repository: https://github.com/microsoft/VibeVoice

@@ -1,0 +1,45 @@
+{
+  "text": "Happy to help. Tell me what you need, and we will sort it out together.",
+  "results": [
+    {
+      "model": "Chatterbox Turbo",
+      "status": "ok",
+      "latency_ms": "3897.5",
+      "params": "350M",
+      "disk": "4.04 GB",
+      "voice": "built-in default",
+      "output": "/Users/nitishkumarharsoor/Documents/1.Learnings/1.Projects/2.AI_agents/07.neuroTalk/scripts/speech/chatterbox.wav",
+      "notes": "Turbo tags via inline prompt. Fell back to built-in default voice because /tmp/voice_agent.wav was missing."
+    },
+    {
+      "model": "Qwen3-TTS 0.6B CustomVoice",
+      "status": "ok",
+      "latency_ms": "7153.1",
+      "params": "0.6B",
+      "disk": "2.5 GB",
+      "voice": "speaker=Ryan",
+      "output": "/Users/nitishkumarharsoor/Documents/1.Learnings/1.Projects/2.AI_agents/07.neuroTalk/scripts/speech/qwen.wav",
+      "notes": "instruct='Very happy and energetic.'; device=cpu"
+    },
+    {
+      "model": "VibeVoice Realtime 0.5B",
+      "status": "ok",
+      "latency_ms": "15960.1",
+      "params": "0.5B",
+      "disk": "2.04 GB",
+      "voice": "speaker=Emma",
+      "output": "/Users/nitishkumarharsoor/Documents/1.Learnings/1.Projects/2.AI_agents/07.neuroTalk/scripts/speech/vibevoice.wav",
+      "notes": "Ran via official realtime demo script on cpu."
+    },
+    {
+      "model": "Kokoro 82M MLX",
+      "status": "ok",
+      "latency_ms": "221.1",
+      "params": "82M",
+      "disk": "355 MB",
+      "voice": "af_heart",
+      "output": "/Users/nitishkumarharsoor/Documents/1.Learnings/1.Projects/2.AI_agents/07.neuroTalk/scripts/speech/kokoro.wav",
+      "notes": "MLX Kokoro with lang_code=a speed=1.0."
+    }
+  ]
+}

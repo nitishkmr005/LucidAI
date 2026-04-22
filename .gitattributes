@@ -1,0 +1,2 @@
+backend/models/stt/model.bin filter=lfs diff=lfs merge=lfs -text
+backend/models/tts/kokoro-v1_0.safetensors filter=lfs diff=lfs merge=lfs -text

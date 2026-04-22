@@ -1,0 +1,94 @@
+[project]
+name = "neurotalk-backend"
+version = "0.1.0"
+description = "Minimal STT backend for NeuroTalk."
+requires-python = ">=3.11"
+dependencies = [
+  "aiortc>=1.9.0",
+  "av>=13.0.0",
+  "fastapi>=0.115.0",
+  "faster-whisper>=1.1.1",
+  "loguru>=0.7.3",
+  "numpy>=1.24.0,<2.0.0; python_version < '3.13'",
+  "numpy>=2.0.0; python_version >= '3.13'",
+  "ollama>=0.3.0",
+  "pydantic-settings>=2.7.1",
+  "python-dotenv>=1.0.1",
+  "python-multipart>=0.0.20",
+  "silero-vad>=6.2.1",
+  "sounddevice>=0.5.2",
+  "uvicorn>=0.34.0",
+  "websockets>=15.0.1",
+  "duckduckgo-search>=6.0.0",
+  "reportlab>=4.0.0",
+  "python-docx>=1.1.0",
+  "markdown>=3.6",
+]
+
+[dependency-groups]
+kokoro_model = [
+  "mlx-audio>=0.4.0",
+  "misaki[en]>=0.9.4",
+  "soundfile>=0.13.1",
+]
+chatterbox_model = [
+  "chatterbox-tts",
+  "soundfile>=0.13.1",
+  "torch==2.6.0; python_version < '3.14'",
+  "torch>=2.9.0; python_version >= '3.14'",
+  "torchaudio==2.6.0; python_version < '3.14'",
+  "torchaudio>=2.9.0; python_version >= '3.14'",
+]
+qwen_model = [
+  "qwen-tts",
+  "soundfile>=0.13.1",
+  "torch==2.6.0; python_version < '3.14'",
+  "torch>=2.9.0; python_version >= '3.14'",
+  "torchaudio==2.6.0; python_version < '3.14'",
+  "torchaudio>=2.9.0; python_version >= '3.14'",
+]
+vibevoice_model = [
+  "soundfile>=0.13.1",
+  "torch==2.6.0; python_version < '3.14'",
+  "torch>=2.9.0; python_version >= '3.14'",
+  "torchaudio==2.6.0; python_version < '3.14'",
+  "torchaudio>=2.9.0; python_version >= '3.14'",
+  "vibevoice",
+]
+omnivoice_model = [
+  "omnivoice",
+  "soundfile>=0.13.1",
+  "torch==2.6.0; python_version < '3.14'",
+  "torch>=2.9.0; python_version >= '3.14'",
+  "torchaudio==2.6.0; python_version < '3.14'",
+  "torchaudio>=2.9.0; python_version >= '3.14'",
+]
+dev = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.23.0",
+  "torch>=2.0.0",
+  "numpy>=1.24.0",
+]
+
+[tool.uv]
+package = false
+conflicts = [
+  [{ group = "kokoro_model" }, { group = "chatterbox_model" }],
+  [{ group = "kokoro_model" }, { group = "qwen_model" }],
+  [{ group = "kokoro_model" }, { group = "vibevoice_model" }],
+  [{ group = "kokoro_model" }, { group = "omnivoice_model" }],
+  [{ group = "chatterbox_model" }, { group = "qwen_model" }],
+  [{ group = "chatterbox_model" }, { group = "vibevoice_model" }],
+  [{ group = "chatterbox_model" }, { group = "omnivoice_model" }],
+  [{ group = "qwen_model" }, { group = "vibevoice_model" }],
+  [{ group = "qwen_model" }, { group = "omnivoice_model" }],
+  [{ group = "vibevoice_model" }, { group = "omnivoice_model" }],
+]
+
+[tool.uv.sources]
+chatterbox-tts = { git = "https://github.com/resemble-ai/chatterbox", branch = "master" }
+vibevoice = { git = "https://github.com/microsoft/VibeVoice", branch = "main" }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

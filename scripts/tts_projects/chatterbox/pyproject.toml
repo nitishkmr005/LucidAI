@@ -1,0 +1,20 @@
+[project]
+name = "neurotalk-tts-chatterbox"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.24.0,<2.0.0; python_version < '3.13'",
+  "numpy>=2.0.0; python_version >= '3.13'",
+  "soundfile>=0.13.1",
+  "torch==2.6.0; python_version < '3.14'",
+  "torch>=2.9.0; python_version >= '3.14'",
+  "torchaudio==2.6.0; python_version < '3.14'",
+  "torchaudio>=2.9.0; python_version >= '3.14'",
+  "chatterbox-tts",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+chatterbox-tts = { git = "https://github.com/resemble-ai/chatterbox", branch = "master" }
