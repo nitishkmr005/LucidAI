@@ -694,79 +694,114 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
 
   return (
     <section className="doc-panel surface">
-      <header className="doc-panel-header">
-        <div>
-          <p className="kicker">Document Reader</p>
-          {docTitle && <h2 className="doc-panel-title">{docTitle}</h2>}
-        </div>
-        <div className="doc-panel-status">
-          {isReading ? (
-            <span className="mode-chip active-listening">
-              <span className="mode-chip-dot" aria-hidden="true" /> Reading
-            </span>
-          ) : null}
-          {activeWordText ? (
-            <span className="doc-word-pill">Live word: {activeWordText}</span>
-          ) : null}
-        </div>
-      </header>
-
-      {searchQuery && (
-        <SearchResultPopup
-          query={searchQuery}
-          results={searchResults}
-          isLoading={isSearchLoading}
-          onDismiss={() => { setSearchQuery(null); setIsSearchLoading(false); }}
-        />
-      )}
-
-      <div className="doc-panel-body" ref={containerRef}>
-        {!hasDocument ? (
-          <DocumentUploader
-            documents={documents}
-            selectedDocId={selectedDocId}
-            isUploading={isUploading}
-            onUpload={handleUpload}
-            onSelect={handleSelectDoc}
-            onDelete={handleDeleteDoc}
-            onRefresh={loadDocuments}
-          />
-        ) : (
-          <div className="doc-content">
-            <div className="doc-content-toolbar">
-              <button
-                type="button"
-                className="doc-back-btn"
-                onClick={() => {
-                  setSentences([]);
-                  setDocTitle("");
-                  setSelectedDocId(null);
-                  onSelectionChange?.(null);
-                  loadDocuments();
-                }}
-              >
-                ← Back to library
-              </button>
-              <span className="doc-reading-status">
-                {isReading ? (
-                  <span className="mode-chip active-listening">
-                    <span className="mode-chip-dot" aria-hidden="true" /> Reading
-                  </span>
-                ) : null}
-              </span>
-            </div>
-            {activeSentenceText ? (
-              <div className="doc-live-status">
-                <span className="doc-live-label">Reading now</span>
-                <p className="doc-live-text">{renderWords(activeSentenceText, true)}</p>
-              </div>
-            ) : null}
-            <div className="doc-markdown">
-              {markdownNodes}
-            </div>
+      <div className="doc-panel-main">
+        <header className="doc-panel-header">
+          <div>
+            <p className="kicker">Document Workspace</p>
+            <h2 className="doc-panel-title">{docTitle || "Document library"}</h2>
           </div>
+          <div className="doc-panel-status">
+            <span className="status-pill is-ghost">{documents.length.toLocaleString()} documents</span>
+            {isReading ? (
+              <span className="mode-chip active-listening">
+                <span className="mode-chip-dot" aria-hidden="true" /> Reading
+              </span>
+            ) : null}
+            {activeWordText ? (
+              <span className="doc-word-pill">Live word: {activeWordText}</span>
+            ) : null}
+          </div>
+        </header>
+
+        {searchQuery && (
+          <SearchResultPopup
+            query={searchQuery}
+            results={searchResults}
+            isLoading={isSearchLoading}
+            onDismiss={() => { setSearchQuery(null); setIsSearchLoading(false); }}
+          />
         )}
+
+        <div className="doc-panel-body" ref={containerRef}>
+          {!hasDocument ? (
+            <DocumentUploader
+              documents={documents}
+              selectedDocId={selectedDocId}
+              isUploading={isUploading}
+              onUpload={handleUpload}
+              onSelect={handleSelectDoc}
+              onDelete={handleDeleteDoc}
+              onRefresh={loadDocuments}
+            />
+          ) : (
+            <div className="doc-content">
+              <div className="doc-content-toolbar">
+                <button
+                  type="button"
+                  className="doc-back-btn"
+                  onClick={() => {
+                    setSentences([]);
+                    setDocTitle("");
+                    setSelectedDocId(null);
+                    onSelectionChange?.(null);
+                    loadDocuments();
+                  }}
+                >
+                  ← Back to library
+                </button>
+                <span className="doc-reading-status">
+                  {isReading ? (
+                    <span className="mode-chip active-listening">
+                      <span className="mode-chip-dot" aria-hidden="true" /> Reading
+                    </span>
+                  ) : null}
+                </span>
+              </div>
+              {activeSentenceText ? (
+                <div className="doc-live-status">
+                  <span className="doc-live-label">Reading now</span>
+                  <p className="doc-live-text">{renderWords(activeSentenceText, true)}</p>
+                </div>
+              ) : null}
+              <div className="doc-markdown">
+                {markdownNodes}
+              </div>
+            </div>
+          )}
+        </div>
       </div>
+      <aside className="doc-rail" aria-label="Document tools">
+        <button type="button" className="doc-rail-item is-active" aria-label="Library">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M7 3h7l4 4v14H7z" />
+            <path d="M14 3v5h5" />
+            <path d="M10 13h6M10 17h4" />
+          </svg>
+          <span>Library</span>
+        </button>
+        <button type="button" className="doc-rail-item" aria-label="Notes">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M5 4h14v16H5z" />
+            <path d="M8 8h8M8 12h8M8 16h5" />
+          </svg>
+          <span>Notes</span>
+        </button>
+        <button type="button" className="doc-rail-item" aria-label="History">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M12 8v5l3 2" />
+            <path d="M4 12a8 8 0 1 0 2.35-5.65L4 8" />
+            <path d="M4 4v4h4" />
+          </svg>
+          <span>History</span>
+        </button>
+        <button type="button" className="doc-rail-item" aria-label="Settings">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M12 15.5A3.5 3.5 0 1 0 12 8a3.5 3.5 0 0 0 0 7.5z" />
+            <path d="M19.4 15a1.8 1.8 0 0 0 .36 1.98l.04.04a2 2 0 1 1-2.83 2.83l-.04-.04A1.8 1.8 0 0 0 15 19.4a1.8 1.8 0 0 0-1 .6 1.8 1.8 0 0 0-.5 1.27V21a2 2 0 1 1-4 0v-.06A1.8 1.8 0 0 0 8 19.4a1.8 1.8 0 0 0-1.98.36l-.04.04a2 2 0 1 1-2.83-2.83l.04-.04A1.8 1.8 0 0 0 4.6 15a1.8 1.8 0 0 0-.6-1 1.8 1.8 0 0 0-1.27-.5H2.7a2 2 0 1 1 0-4h.06A1.8 1.8 0 0 0 4.6 8a1.8 1.8 0 0 0-.36-1.98l-.04-.04a2 2 0 1 1 2.83-2.83l.04.04A1.8 1.8 0 0 0 9 4.6a1.8 1.8 0 0 0 1-.6A1.8 1.8 0 0 0 10.5 2.73V2.7a2 2 0 1 1 4 0v.06A1.8 1.8 0 0 0 15 4.6a1.8 1.8 0 0 0 1.98-.36l.04-.04a2 2 0 1 1 2.83 2.83l-.04.04A1.8 1.8 0 0 0 19.4 9c.3.33.6.66 1 .6h.06a2 2 0 1 1 0 4h-.06a1.8 1.8 0 0 0-1 .6z" />
+          </svg>
+          <span>Settings</span>
+        </button>
+      </aside>
     </section>
   );
 }

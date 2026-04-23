@@ -87,30 +87,26 @@ const modeConfig: Record<
 > = {
   listening: {
     eyebrow: "Listening",
-    headline: "I'm listening. Speak naturally.",
-    summary:
-      "Ask me anything — I'll respond as soon as I understand. You can interrupt my reply at any point by speaking.",
+    headline: "Listening",
+    summary: "Realtime speech capture is ready.",
     accent: "active-listening",
   },
   thinking: {
-    eyebrow: "Processing your speech",
-    headline: "Catching your words in real time.",
-    summary:
-      "Your speech is being transcribed as you talk. The AI will begin composing a reply once it understands your intent.",
+    eyebrow: "Processing",
+    headline: "Processing",
+    summary: "Speech is being transcribed and routed.",
     accent: "deep-reasoning",
   },
   responding: {
-    eyebrow: "Composing a reply",
-    headline: "Thinking of what to say.",
-    summary:
-      "The AI is crafting a response to what you said. It will speak the reply aloud in just a moment.",
+    eyebrow: "Responding",
+    headline: "Responding",
+    summary: "The answer is being prepared.",
     accent: "voice-delivery",
   },
   speaking: {
-    eyebrow: "AI speaking",
-    headline: "Hear the reply.",
-    summary:
-      "The AI is speaking its reply. Interrupt at any time by speaking — it will stop and listen immediately.",
+    eyebrow: "Speaking",
+    headline: "Speaking",
+    summary: "Voice playback is active.",
     accent: "voice-delivery",
   },
 };
@@ -142,6 +138,14 @@ function formatVoiceName(voiceId: string): string {
 }
 
 const FALLBACK_TTS_VOICES: TtsVoice[] = fallbackTtsVoiceIds.map((id) => ({ id, name: formatVoiceName(id) }));
+
+function getVoiceLabel(voice: TtsVoice): { displayName: string; detail: string } {
+  const match = voice.name.match(/^(.+?)\s+\((.+)\)$/);
+  if (!match) {
+    return { displayName: voice.name, detail: "Assistant Voice" };
+  }
+  return { displayName: match[1], detail: match[2] };
+}
 
 function float32ToInt16(input: Float32Array): Int16Array {
   const output = new Int16Array(input.length);
@@ -1445,6 +1449,22 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
   const orbDriftY = `${(amplitude * -10).toFixed(2)}px`;
   const selectedVoice = ttsVoices.find((voice) => voice.id === selectedTtsVoice) ?? ttsVoices[0] ?? FALLBACK_TTS_VOICES[0];
   const voicePreviewDisabled = isRecording || isConnecting || mode === "speaking";
+  const selectedVoiceIndex = Math.max(0, ttsVoices.findIndex((voice) => voice.id === selectedVoice.id));
+  const selectedVoiceLabel = getVoiceLabel(selectedVoice);
+  const visibleVoiceOffsets = [-2, -1, 0, 1, 2];
+  const visibleVoiceItems = visibleVoiceOffsets
+    .map((offset) => {
+      if (!ttsVoices.length) return null;
+      const index = (selectedVoiceIndex + offset + ttsVoices.length) % ttsVoices.length;
+      const voice = ttsVoices[index];
+      return { voice, offset, index, label: getVoiceLabel(voice) };
+    })
+    .filter(Boolean) as { voice: TtsVoice; offset: number; index: number; label: { displayName: string; detail: string } }[];
+  const selectAdjacentVoice = useCallback((direction: -1 | 1) => {
+    if (!ttsVoices.length) return;
+    const nextIndex = (selectedVoiceIndex + direction + ttsVoices.length) % ttsVoices.length;
+    selectVoice(ttsVoices[nextIndex].id);
+  }, [selectedVoiceIndex, selectVoice, ttsVoices]);
 
   return (
     <main className="console-shell">
@@ -1453,18 +1473,36 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
         {/* ── Topbar ──────────────────────────────────────────── */}
         <header className="topbar surface">
           <div>
-            <p className="kicker">Your AI powered reading companion</p>
+            <p className="kicker">Document Intelligence Workspace</p>
             <h1>NeuroTalk</h1>
+            <p className="topbar-tagline">Document Intelligence Workspace</p>
           </div>
+          <nav className="app-tabs" aria-label="Workspace mode">
+            <button type="button" className="app-tab is-active" aria-pressed="true">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true">
+                <path d="M4 12v.01M8 7v10M12 4v16M16 8v8M20 11v2" />
+              </svg>
+              Conversation
+            </button>
+            <button type="button" className="app-tab" aria-pressed="false">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+                <path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5z" />
+              </svg>
+              Reading
+            </button>
+          </nav>
           <div className="topbar-meta">
+            <span className="status-pill is-live">Realtime sync</span>
+            <span className="status-pill is-ghost">Private session</span>
             <button
               type="button"
-              className="settings-button"
+              className="voice-lens-button"
               onClick={() => setIsVoiceSettingsOpen(true)}
               aria-label="Open voice settings"
+              title={selectedVoice.name}
             >
-              <span className="settings-button-label">Voice</span>
-              <strong>{selectedVoice.name}</strong>
+              <span className="voice-lens-core" aria-hidden="true" />
             </button>
             <button
               type="button"
@@ -1502,149 +1540,260 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
               aria-labelledby="voice-settings-title"
               onClick={(event) => event.stopPropagation()}
             >
-              <div className="voice-settings-header">
-                <div>
-                  <p className="kicker">Voice Settings</p>
-                  <h2 id="voice-settings-title">Choose NeuroTalk voice</h2>
-                  <p>Tap any sphere to preview and select the assistant voice.</p>
+              <aside className="voice-settings-nav" aria-label="Voice settings sections">
+                <button type="button" className="voice-settings-nav-item is-active">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true">
+                    <path d="M4 12v.01M8 7v10M12 4v16M16 8v8M20 11v2" />
+                  </svg>
+                  Voice
+                </button>
+                <button type="button" className="voice-settings-nav-item">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <path d="M4 13a8 8 0 1 1 16 0" />
+                    <path d="M4 13h3l1 5h8l1-5h3" />
+                  </svg>
+                  Speech speed
+                </button>
+                <button type="button" className="voice-settings-nav-item">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <path d="M11 5 6 9H3v6h3l5 4z" />
+                    <path d="M16 9a5 5 0 0 1 0 6" />
+                    <path d="M19 6a9 9 0 0 1 0 12" />
+                  </svg>
+                  Playback
+                </button>
+                <div className="voice-tip">
+                  <strong>Tip</strong>
+                  <span>You can change voices anytime during a session.</span>
                 </div>
+              </aside>
+
+              <div className="voice-settings-stage">
                 <button
                   type="button"
                   className="settings-close-button"
                   onClick={() => setIsVoiceSettingsOpen(false)}
                   aria-label="Close voice settings"
                 >
-                  Close
+                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true">
+                    <path d="M6 6l12 12M18 6 6 18" />
+                  </svg>
                 </button>
-              </div>
 
-              <div className="voice-orb-grid">
-                {ttsVoices.map((voice, index) => {
-                  const isSelected = voice.id === selectedTtsVoice;
-                  const isPreviewing = previewingVoice === voice.id;
-                  return (
-                    <button
-                      key={voice.id}
-                      type="button"
-                      className={[
-                        "voice-orb-button",
-                        isSelected ? "is-selected" : "",
-                        isPreviewing ? "is-previewing" : "",
-                      ].filter(Boolean).join(" ")}
-                      onClick={() => selectVoice(voice.id)}
-                      data-preview-disabled={voicePreviewDisabled}
-                      style={{ "--voice-index": index } as CSSProperties}
-                      aria-pressed={isSelected}
-                      aria-label={`Select and preview ${voice.name} voice`}
-                    >
-                      <span className="voice-orb-glow" aria-hidden="true" />
-                      <span className="voice-orb-name">{voice.name}</span>
-                      <span className="voice-orb-action">{isPreviewing ? "Playing" : isSelected ? "Selected" : "Preview"}</span>
-                    </button>
-                  );
-                })}
-              </div>
+                <header className="voice-settings-hero">
+                  <div className="voice-settings-mark" aria-hidden="true">
+                    <span />
+                    <span />
+                    <span />
+                    <span />
+                  </div>
+                  <p className="kicker">Voice Settings</p>
+                  <h2 id="voice-settings-title">Choose your NeuroTalk voice</h2>
+                  <p>Preview and select the voice used for reading and answers.</p>
+                </header>
 
-              <div className="voice-settings-footer">
-                <span>{voicePreviewDisabled ? "Stop the live session to preview voices." : "Preview uses the same backend TTS as document reading."}</span>
-                {voicePreviewError ? <strong>{voicePreviewError}</strong> : null}
+                <div className="voice-carousel">
+                  <button
+                    type="button"
+                    className="voice-carousel-arrow voice-carousel-arrow--left"
+                    onClick={() => selectAdjacentVoice(-1)}
+                    aria-label="Previous voice"
+                  >
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                      <path d="m15 18-6-6 6-6" />
+                    </svg>
+                  </button>
+
+                  <div className="voice-carousel-track">
+                    {visibleVoiceItems.map((item) => {
+                      const isSelected = item.voice.id === selectedTtsVoice;
+                      const isPreviewing = previewingVoice === item.voice.id;
+                      return (
+                        <button
+                          key={`${item.voice.id}-${item.offset}`}
+                          type="button"
+                          className={[
+                            "voice-choice",
+                            `voice-choice--offset-${item.offset}`,
+                            isSelected ? "is-selected" : "",
+                            isPreviewing ? "is-previewing" : "",
+                          ].filter(Boolean).join(" ")}
+                          style={{ "--voice-index": item.index } as CSSProperties}
+                          onClick={() => selectVoice(item.voice.id)}
+                          aria-pressed={isSelected}
+                          aria-label={`Select and preview ${item.voice.name} voice`}
+                        >
+                          <span className="voice-choice-portrait" aria-hidden="true" />
+                          <span className="voice-choice-wave" aria-hidden="true">
+                            <span /><span /><span /><span />
+                          </span>
+                          <strong>{item.label.displayName}</strong>
+                          <small>{item.label.detail}</small>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  <button
+                    type="button"
+                    className="voice-carousel-arrow voice-carousel-arrow--right"
+                    onClick={() => selectAdjacentVoice(1)}
+                    aria-label="Next voice"
+                  >
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                      <path d="m9 18 6-6-6-6" />
+                    </svg>
+                  </button>
+                </div>
+
+                <div className="voice-selected-copy">
+                  <div className="voice-selected-wave" aria-hidden="true">
+                    <span /><span /><span /><span /><span />
+                  </div>
+                  <h3>{selectedVoiceLabel.displayName}</h3>
+                  <p>{selectedVoiceLabel.detail}</p>
+                  <div className="voice-mini-wave" aria-hidden="true">
+                    {waveformHeights.slice(0, 18).map((height, index) => (
+                      <span key={`${height}-${index}`} style={{ "--bar-height": `${8 + (index % 5) * 5}px` } as CSSProperties} />
+                    ))}
+                  </div>
+                  <p className="voice-description">Warm, natural and empathetic. Great for conversations, reading and storytelling.</p>
+                </div>
+
+                <div className="voice-settings-actions">
+                  <button
+                    type="button"
+                    className="voice-preview-button"
+                    onClick={() => previewVoice(selectedTtsVoice)}
+                    disabled={voicePreviewDisabled}
+                  >
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                      <path d="m8 5 11 7-11 7z" />
+                    </svg>
+                    {previewingVoice === selectedTtsVoice ? "Playing preview" : "Preview this voice"}
+                  </button>
+                  <button
+                    type="button"
+                    className="voice-use-button"
+                    onClick={() => setIsVoiceSettingsOpen(false)}
+                  >
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                      <path d="m20 6-11 11-5-5" />
+                    </svg>
+                    Use this voice
+                  </button>
+                </div>
+
+                <div className="voice-carousel-dots" aria-hidden="true">
+                  {[-2, -1, 0, 1, 2].map((dot) => (
+                    <span key={dot} className={dot === 0 ? "is-active" : undefined} />
+                  ))}
+                </div>
+
+                <footer className="voice-settings-footer">
+                  <span>{voicePreviewDisabled ? "Stop the live session to preview voices." : "Your voice preference is saved locally and synced to the active session."}</span>
+                  {voicePreviewError ? <strong>{voicePreviewError}</strong> : null}
+                </footer>
               </div>
             </section>
           </div>
         )}
 
         <div className="console-body">
-          {/* ── Orb Zone ─────────────────────────────────────────── */}
-          <div className="orb-zone surface">
-            <div className="orb-zone-header">
-              <span className={`mode-chip ${activeMode.accent}`}>
-                {(mode === "listening" || mode === "speaking") && (
-                  <span className="mode-chip-dot" aria-hidden="true" />
-                )}
-                {activeMode.eyebrow}
-              </span>
-              <div className="mode-switcher">
-                {(["listening", "thinking", "responding"] as Mode[]).map((item, index) => (
-                  <Fragment key={item}>
-                    {index > 0 && (
-                      <span className={`mode-step-line${
-                        ["listening", "thinking", "responding"].indexOf(mode) >= index ? " is-active" : ""
-                      }`} />
-                    )}
-                    <button
-                      type="button"
-                      className={item === mode ? "mode-button is-selected" : "mode-button is-static"}
-                      disabled
-                    >{item}</button>
-                  </Fragment>
-                ))}
+          <div className="voice-workspace">
+            {/* ── Orb Zone ─────────────────────────────────────────── */}
+            <div className="orb-zone surface">
+              <div className="orb-zone-header">
+                <span className={`mode-chip ${activeMode.accent}`}>
+                  {(mode === "listening" || mode === "speaking") && (
+                    <span className="mode-chip-dot" aria-hidden="true" />
+                  )}
+                  {activeMode.eyebrow}
+                </span>
+                <div className="mode-switcher">
+                  {(["listening", "thinking", "responding"] as Mode[]).map((item, index) => (
+                    <Fragment key={item}>
+                      {index > 0 && (
+                        <span className={`mode-step-line${
+                          ["listening", "thinking", "responding"].indexOf(mode) >= index ? " is-active" : ""
+                        }`} />
+                      )}
+                      <button
+                        type="button"
+                        className={item === mode ? "mode-button is-selected" : "mode-button is-static"}
+                        disabled
+                      >{item}</button>
+                    </Fragment>
+                  ))}
+                </div>
               </div>
-            </div>
 
-            <div className="orb-stage">
-              <div className="orb-center-row">
-                <button
-                  type="button"
-                  className={[
-                    "orbital-core",
-                    isRecording ? "orbital-core--recording" : "",
-                    isConnecting ? "orbital-core--connecting" : "",
-                  ].filter(Boolean).join(" ")}
-                  disabled={controlDisabled}
-                  onClick={isRecording || isConnecting ? stopStreaming : () => void startStreaming()}
-                  aria-label={controlLabel}
-                  style={
-                    {
-                      "--orb-scale": orbScale,
-                      "--orb-glow": orbGlow,
-                      "--orb-tilt": orbTilt,
-                      "--orb-core-scale": orbCoreScale,
-                      "--orb-drift-x": orbDriftX,
-                      "--orb-drift-y": orbDriftY,
-                    } as CSSProperties
-                  }
-                >
-                  <div className="orb-ring orb-ring-1" />
-                  <div className="orb-ring orb-ring-2" />
-                  <div className="orb-center" />
-                  <div className="orb-scanline" />
-                </button>
+              <div className="orb-stage">
+                <div className="orb-center-row">
+                  <button
+                    type="button"
+                    className={[
+                      "orbital-core",
+                      isRecording ? "orbital-core--recording" : "",
+                      isConnecting ? "orbital-core--connecting" : "",
+                    ].filter(Boolean).join(" ")}
+                    disabled={controlDisabled}
+                    onClick={isRecording || isConnecting ? stopStreaming : () => void startStreaming()}
+                    aria-label={controlLabel}
+                    style={
+                      {
+                        "--orb-scale": orbScale,
+                        "--orb-glow": orbGlow,
+                        "--orb-tilt": orbTilt,
+                        "--orb-core-scale": orbCoreScale,
+                        "--orb-drift-x": orbDriftX,
+                        "--orb-drift-y": orbDriftY,
+                      } as CSSProperties
+                    }
+                  >
+                    <div className="orb-ring orb-ring-1" />
+                    <div className="orb-ring orb-ring-2" />
+                    <div className="orb-center" />
+                    <div className="orb-scanline" />
+                  </button>
 
-                <div className="orb-side">
-                  <div className="wave-grid" aria-hidden="true">
-                    {waveformHeights.map((height, index) => (
-                      <span
-                        className="wave-bar"
-                        key={`${height}-${index}`}
-                        style={
-                          {
-                            "--bar-height": `${24 + waveLevels[index] * 90}px`,
-                            "--bar-delay": `${index * 0.03}s`,
-                            "--bar-opacity": (0.3 + waveLevels[index] * 0.7).toFixed(3),
-                            "--bar-scale": (0.82 + waveLevels[index] * 0.48).toFixed(3),
-                          } as CSSProperties
-                        }
-                      />
-                    ))}
-                  </div>
-                  <p className={`orb-tap-hint${isRecording ? " is-active" : isFinalizing ? " is-muted" : ""}`}>
-                    {error
-                      ? <span className="is-error">{error}</span>
-                      : isFinalizing
-                        ? "Processing…"
+                  <div className="orb-side">
+                    <p className="orb-status-title">
+                      {isFinalizing
+                        ? "Thinking..."
                         : isConnecting && !isRecording
-                          ? "Starting…"
-                          : isRecording
-                            ? "Tap to stop"
-                            : "Tap to speak"}
-                  </p>
+                          ? "Starting..."
+                          : mode === "speaking"
+                            ? "Speaking..."
+                            : "Listening..."}
+                    </p>
+                    <p className={`orb-tap-hint${isRecording ? " is-active" : isFinalizing ? " is-muted" : ""}`}>
+                      {error
+                        ? <span className="is-error">{error}</span>
+                        : isRecording
+                          ? "Speak naturally, I'm here to help."
+                          : activeMode.summary}
+                    </p>
+                    <div className="wave-grid" aria-hidden="true">
+                      {waveformHeights.map((height, index) => (
+                        <span
+                          className="wave-bar"
+                          key={`${height}-${index}`}
+                          style={
+                            {
+                              "--bar-height": `${24 + waveLevels[index] * 90}px`,
+                              "--bar-delay": `${index * 0.03}s`,
+                              "--bar-opacity": (0.3 + waveLevels[index] * 0.7).toFixed(3),
+                              "--bar-scale": (0.82 + waveLevels[index] * 0.48).toFixed(3),
+                            } as CSSProperties
+                          }
+                        />
+                      ))}
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
-          </div>
-
-          <div className="console-sidebar">
-            {children}
 
             {/* ── Transcript Feed ─────────────────────────────────── */}
             <article className="transcript-panel surface">
@@ -1678,8 +1827,17 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
 
               <div className="chat-thread">
                 {messages.length === 0 ? (
-                  <div className="chat-empty">
-                    <p>Tap the orb to start a session, then speak naturally.</p>
+                  <div className="transcript-sample" aria-label="Transcript preview">
+                    <div className="transcript-line transcript-line--user">
+                      <span className="transcript-avatar" aria-hidden="true" />
+                      <p><strong>You</strong> <span>00:12</span></p>
+                      <p>Can you explain the main idea of this document?</p>
+                    </div>
+                    <div className="transcript-line transcript-line--assistant">
+                      <span className="transcript-avatar" aria-hidden="true" />
+                      <p><strong>NeuroTalk</strong> <span>00:15</span></p>
+                      <p>The document introduces PrismDocs, an intelligent document generator that transforms complex content into clear, structured, accessible documents...</p>
+                    </div>
                   </div>
                 ) : (
                   messages.map((msg) => (
@@ -1726,6 +1884,10 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
               </div>
             </article>
           </div>
+
+          <div className="document-workspace">
+            {children}
+          </div>
         </div>
 
       </section>
@@ -1734,7 +1896,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
         <div className="console-footer-inner">
           <span className="console-footer-brand">NeuroTalk</span>
           <span className="console-footer-sep" aria-hidden="true">·</span>
-          <span className="console-footer-tagline">Your AI powered reading companion</span>
+          <span className="console-footer-tagline">Customer-ready document voice interface</span>
           <span className="console-footer-sep" aria-hidden="true">·</span>
           <a
             className="console-footer-link"
