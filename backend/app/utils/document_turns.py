@@ -17,6 +17,9 @@ _STOPWORDS = {
     "stop", "tell", "that", "the", "this", "to", "what", "where", "which",
     "why", "with", "you",
 }
+_READ_KEYWORDS = ("read", "start reading", "read aloud", "begin reading")
+_BEGINNING_KEYWORDS = ("beginning", "from start", "start over", "restart", "from the top")
+_CONTINUE_KEYWORDS = ("continue reading", "keep reading", "resume reading", "where you left", "where we left")
 
 DocumentAction = Literal[
     "answer",
@@ -25,6 +28,8 @@ DocumentAction = Literal[
     "pause_reading",
     "ask_document_clarification",
     "list_documents",
+    "save_note",
+    "highlight_sentence",
 ]
 
 
@@ -34,6 +39,26 @@ class DocumentTurnDecision:
     document_name: str | None = None
     response_text: str = ""
     restart_from_beginning: bool = False
+    sentence_idx: int | None = None
+    note_text: str = ""
+    highlight_color: str = "yellow"
+
+
+def detect_direct_read_intent(user_text: str) -> DocumentTurnDecision | None:
+    normalized = _normalize(user_text)
+    if not normalized:
+        return None
+
+    if any(_normalize(keyword) in normalized for keyword in _CONTINUE_KEYWORDS):
+        return DocumentTurnDecision(action="continue_reading")
+
+    if any(_normalize(keyword) in normalized for keyword in _READ_KEYWORDS):
+        return DocumentTurnDecision(
+            action="read_document",
+            restart_from_beginning=any(_normalize(keyword) in normalized for keyword in _BEGINNING_KEYWORDS),
+        )
+
+    return None
 
 
 def _normalize(value: str) -> str:
@@ -117,6 +142,11 @@ def build_document_turn_context(
             if excerpt:
                 lines.append("Relevant selected-document excerpts:")
                 lines.extend(f"[{idx}] {sentence}" for idx, sentence in excerpt)
+            if last_read_sentence_idx >= 0:
+                start = max(0, last_read_sentence_idx - 12)
+                end = min(len(doc.sentences), last_read_sentence_idx + 1)
+                lines.append("Document reading history up to the current point:")
+                lines.extend(f"[{idx}] {doc.sentences[idx]}" for idx in range(start, end))
         else:
             lines.extend(["", "Selected document: none"])
     else:
@@ -144,6 +174,8 @@ def parse_document_turn_response(raw: str) -> DocumentTurnDecision:
         "pause_reading",
         "ask_document_clarification",
         "list_documents",
+        "save_note",
+        "highlight_sentence",
     }:
         action = "answer"
 
@@ -160,12 +192,23 @@ def parse_document_turn_response(raw: str) -> DocumentTurnDecision:
         or payload.get("start_from_beginning")
         or payload.get("restart")
     )
+    sentence_idx = payload.get("sentence_idx")
+    try:
+        parsed_sentence_idx = int(sentence_idx) if sentence_idx is not None else None
+    except (TypeError, ValueError):
+        parsed_sentence_idx = None
+
+    note_text = payload.get("note_text") or payload.get("note") or ""
+    highlight_color = str(payload.get("highlight_color") or payload.get("color") or "yellow").strip() or "yellow"
 
     return DocumentTurnDecision(
         action=action,
         document_name=document_name,
         response_text=str(response_text).strip(),
         restart_from_beginning=restart_from_beginning,
+        sentence_idx=parsed_sentence_idx,
+        note_text=str(note_text).strip(),
+        highlight_color=highlight_color,
     )
 
 

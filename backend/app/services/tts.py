@@ -16,8 +16,22 @@ from config.settings import get_settings
 
 _WARMUP_TEXT = "Hello."
 
-_KOKORO_MODEL_ID = "mlx-community/Kokoro-82M-bf16"
-_KOKORO_VOICE = "af_heart"
+_DEFAULT_VOICE = "af_heart"
+_VOICE_ACCENTS: dict[str, str] = {
+    "a": "American",
+    "b": "British",
+    "e": "Spanish",
+    "f": "French",
+    "h": "Hindi",
+    "i": "Italian",
+    "j": "Japanese",
+    "p": "Portuguese",
+    "z": "Mandarin",
+}
+_VOICE_GENDERS: dict[str, str] = {
+    "f": "Female",
+    "m": "Male",
+}
 _KOKORO_SPEED = 1.0
 _KOKORO_LANG = "a"
 _ESPEAK_CANDIDATES = [
@@ -25,6 +39,40 @@ _ESPEAK_CANDIDATES = [
     "/usr/local/share/espeak-ng-data",
     "/usr/share/espeak-ng-data",
 ]
+_BACKEND_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _title_voice_name(voice_id: str) -> str:
+    parts = voice_id.split("_", 1)
+    if len(parts) != 2 or len(parts[0]) != 2:
+        return voice_id.replace("_", " ").title()
+    prefix, name = parts
+    accent = _VOICE_ACCENTS.get(prefix[0], prefix[0].upper())
+    gender = _VOICE_GENDERS.get(prefix[1], prefix[1].upper())
+    return f"{name.replace('_', ' ').title()} ({accent} {gender})"
+
+
+def _voice_sort_key(voice_id: str) -> tuple[int, str]:
+    if voice_id == _DEFAULT_VOICE:
+        return (0, voice_id)
+    return (1, voice_id)
+
+
+def _local_tts_model_path() -> Path:
+    model_path = get_settings().tts_model_path
+    return model_path if model_path.is_absolute() else _BACKEND_ROOT / model_path
+
+
+def _kokoro_voice_ids() -> list[str]:
+    voices_dir = _local_tts_model_path() / "voices"
+    if not voices_dir.exists():
+        return [_DEFAULT_VOICE]
+    voice_ids = sorted((path.stem for path in voices_dir.glob("*.safetensors")), key=_voice_sort_key)
+    return voice_ids or [_DEFAULT_VOICE]
+
+
+def _kokoro_voice_path(voice_id: str) -> Path:
+    return _local_tts_model_path() / "voices" / f"{voice_id}.safetensors"
 
 
 class TTSService:
@@ -46,8 +94,11 @@ class TTSService:
                     os.environ["ESPEAK_DATA_PATH"] = candidate
                     break
         from mlx_audio.tts.utils import load_model
-        model = load_model(_KOKORO_MODEL_ID)
-        for _ in model.generate(_WARMUP_TEXT, voice=_KOKORO_VOICE, speed=_KOKORO_SPEED, lang_code=_KOKORO_LANG):
+        model_path = _local_tts_model_path()
+        if not model_path.exists():
+            raise FileNotFoundError(f"Local TTS model path not found: {model_path}")
+        model = load_model(model_path)
+        for _ in model.generate(_WARMUP_TEXT, voice=str(_kokoro_voice_path(_DEFAULT_VOICE)), speed=_KOKORO_SPEED, lang_code=_KOKORO_LANG):
             pass
         return model
 
@@ -63,15 +114,25 @@ class TTSService:
         model.generate(_WARMUP_TEXT)
         return model
 
-    def _run_inference(self, text: str) -> tuple[bytes, int]:
-        return self._run_kokoro(text) if self._backend == "kokoro" else self._run_chatterbox(text)
+    def _resolve_voice(self, voice: str | None) -> str:
+        if self._backend != "kokoro":
+            return _DEFAULT_VOICE
+        if voice and voice in set(_kokoro_voice_ids()) and _kokoro_voice_path(voice).exists():
+            return voice
+        return _DEFAULT_VOICE
 
-    def _run_kokoro(self, text: str) -> tuple[bytes, int]:
+    def _run_inference(self, text: str, voice: str | None = None) -> tuple[bytes, int]:
+        return self._run_kokoro(text, self._resolve_voice(voice)) if self._backend == "kokoro" else self._run_chatterbox(text)
+
+    def _run_kokoro(self, text: str, voice: str) -> tuple[bytes, int]:
         from app.utils.emotion import strip_emotion_tags
         clean = strip_emotion_tags(text)
         final_audio = None
         sample_rate = 24000
-        for result in self._model.generate(clean, voice=_KOKORO_VOICE, speed=_KOKORO_SPEED, lang_code=_KOKORO_LANG):
+        voice_path = _kokoro_voice_path(voice)
+        if not voice_path.exists():
+            raise FileNotFoundError(f"Local Kokoro voice not found: {voice_path}")
+        for result in self._model.generate(clean, voice=str(voice_path), speed=_KOKORO_SPEED, lang_code=_KOKORO_LANG):
             final_audio = result.audio
             sample_rate = getattr(result, "sample_rate", 24000)
         if final_audio is None:
@@ -103,7 +164,7 @@ class TTSService:
             wf.writeframes(pcm16.tobytes())
         return buf.getvalue(), self._model.sr
 
-    async def synthesize(self, text: str) -> tuple[bytes, int]:
+    async def synthesize(self, text: str, voice: str | None = None) -> tuple[bytes, int]:
         if self._model is None:
             async with self._load_lock:
                 if self._model is None:
@@ -111,12 +172,13 @@ class TTSService:
                     self._model = await loop.run_in_executor(None, self._load_model)
         loop = asyncio.get_event_loop()
         started_at = perf_counter()
-        wav_bytes, sample_rate = await loop.run_in_executor(None, self._run_inference, text)
+        resolved_voice = self._resolve_voice(voice)
+        wav_bytes, sample_rate = await loop.run_in_executor(None, self._run_inference, text, resolved_voice)
         latency_ms = round((perf_counter() - started_at) * 1000, 2)
         log_module_io(
             module="tts",
             latency_ms=latency_ms,
-            input_payload={"text": text, "backend": self._backend},
+            input_payload={"text": text, "backend": self._backend, "voice": resolved_voice},
             output_payload={"audio_bytes": len(wav_bytes), "sample_rate": sample_rate},
         )
         return wav_bytes, sample_rate
@@ -130,3 +192,14 @@ def get_tts_service() -> TTSService:
     if _tts_service is None:
         _tts_service = TTSService()
     return _tts_service
+
+
+def get_available_tts_voices() -> list[dict[str, str]]:
+    return [
+        {"id": voice_id, "name": _title_voice_name(voice_id)}
+        for voice_id in _kokoro_voice_ids()
+    ]
+
+
+def get_default_tts_voice() -> str:
+    return _DEFAULT_VOICE

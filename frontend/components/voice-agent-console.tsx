@@ -38,11 +38,16 @@ type DebugInfo = {
   chunks_received: number | null;
 };
 
+type TtsVoice = {
+  id: string;
+  name: string;
+};
+
 type StreamMessage = {
   type: "ready" | "partial" | "final" | "error" | "llm_start" | "llm_partial" | "llm_final" | "llm_error" | "tts_start" | "tts_audio" | "tts_done" | "tts_interrupted"
       | "doc_list" | "doc_read_start" | "doc_opened" | "doc_highlight" | "doc_save_snippet"
       | "doc_search_start" | "doc_search_result" | "doc_export" | "doc_reading_pause" | "doc_reading_resume"
-      | "doc_error" | "doc_highlight_saved" | "doc_list_requested";
+      | "doc_error" | "doc_highlight_saved" | "doc_note_saved" | "doc_list_requested";
   request_id?: string;
   text?: string;
   user_text?: string;
@@ -60,8 +65,10 @@ type StreamMessage = {
   title?: string;
   raw_markdown?: string;
   annotations?: unknown;
+  snippet?: unknown;
   sentence_idx?: number;
   word_count?: number;
+  color?: string;
   term?: string;
   query?: string;
   results?: unknown[];
@@ -114,6 +121,27 @@ const websocketUrl = `${backendUrl.replace(/^http/, "ws")}/ws/transcribe`;
 const initialWaveLevels = waveformHeights.map(() => 0.18);
 const BARGE_IN_THRESHOLD = 0.15;
 const BARGE_IN_FRAMES = 1;
+const fallbackTtsVoiceIds = [
+  "af_heart", "af_alloy", "af_aoede", "af_bella", "af_jessica", "af_kore", "af_nicole", "af_nova", "af_river", "af_sarah", "af_sky",
+  "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam", "am_michael", "am_onyx", "am_puck", "am_santa",
+  "bf_alice", "bf_emma", "bf_isabella", "bf_lily", "bm_daniel", "bm_fable", "bm_george", "bm_lewis",
+  "ef_dora", "em_alex", "em_santa", "ff_siwis", "hf_alpha", "hf_beta", "hm_omega", "hm_psi",
+  "if_sara", "im_nicola", "jf_alpha", "jf_gongitsune", "jf_nezumi", "jf_tebukuro", "jm_kumo",
+  "pf_dora", "pm_alex", "pm_santa", "zf_xiaobei", "zf_xiaoni", "zf_xiaoxiao", "zf_xiaoyi",
+  "zm_yunjian", "zm_yunxi", "zm_yunxia", "zm_yunyang",
+];
+const defaultTtsVoice = "af_heart";
+const ttsVoiceStorageKey = "neurotalk-tts-voice";
+
+function formatVoiceName(voiceId: string): string {
+  const [prefix, rawName] = voiceId.split("_");
+  const accent = ({ a: "American", b: "British", e: "Spanish", f: "French", h: "Hindi", i: "Italian", j: "Japanese", p: "Portuguese", z: "Mandarin" } as Record<string, string>)[prefix?.[0] ?? ""] ?? prefix?.[0]?.toUpperCase() ?? "";
+  const gender = ({ f: "Female", m: "Male" } as Record<string, string>)[prefix?.[1] ?? ""] ?? prefix?.[1]?.toUpperCase() ?? "";
+  const name = (rawName ?? voiceId).replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+  return accent && gender ? `${name} (${accent} ${gender})` : name;
+}
+
+const FALLBACK_TTS_VOICES: TtsVoice[] = fallbackTtsVoiceIds.map((id) => ({ id, name: formatVoiceName(id) }));
 
 function float32ToInt16(input: Float32Array): Int16Array {
   const output = new Int16Array(input.length);
@@ -156,7 +184,12 @@ type VoiceAgentConsoleProps = {
 
 export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEvent, onSnippetExplanation }: VoiceAgentConsoleProps = {}) {
   const [isDark, setIsDark] = useState(true);
-  const [transportType, setTransportType] = useState<TransportType>("webrtc");
+  const [transportType] = useState<TransportType>("webrtc");
+  const [ttsVoices, setTtsVoices] = useState<TtsVoice[]>(FALLBACK_TTS_VOICES);
+  const [selectedTtsVoice, setSelectedTtsVoice] = useState<string>(defaultTtsVoice);
+  const [isVoiceSettingsOpen, setIsVoiceSettingsOpen] = useState(false);
+  const [previewingVoice, setPreviewingVoice] = useState<string | null>(null);
+  const [voicePreviewError, setVoicePreviewError] = useState<string | null>(null);
   const [mode, setMode] = useState<Mode>("listening");
   const [isRecording, setIsRecording] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
@@ -221,12 +254,40 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
   const waveLevelsRef = useRef(initialWaveLevels);
   const startAttemptRef = useRef(0);
   const loadedDocumentIdRef = useRef<string | null>(null);
+  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+  const previewAudioUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
     const saved = localStorage.getItem("nt-theme");
     const dark = saved !== "light";
     setIsDark(dark);
     document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+
+    const savedVoice = localStorage.getItem(ttsVoiceStorageKey);
+    if (savedVoice && FALLBACK_TTS_VOICES.some((voice) => voice.id === savedVoice)) {
+      setSelectedTtsVoice(savedVoice);
+    }
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem(ttsVoiceStorageKey, selectedTtsVoice);
+  }, [selectedTtsVoice]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetch(`${backendUrl}/tts/voices`)
+      .then((response) => response.ok ? response.json() : null)
+      .then((payload: { default_voice?: string; voices?: TtsVoice[] } | null) => {
+        if (cancelled || !payload?.voices?.length) return;
+        setTtsVoices(payload.voices);
+        setSelectedTtsVoice((current) => (
+          payload.voices?.some((voice) => voice.id === current)
+            ? current
+            : payload.default_voice ?? defaultTtsVoice
+        ));
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
   }, []);
 
   const toggleTheme = () => {
@@ -386,6 +447,10 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
   useEffect(() => {
     return () => {
       stopAudioGraph();
+      previewAudioRef.current?.pause();
+      if (previewAudioUrlRef.current) {
+        URL.revokeObjectURL(previewAudioUrlRef.current);
+      }
       websocketRef.current?.close();
       websocketRef.current = null;
     };
@@ -471,6 +536,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
           if (payload.type === "ready") {
             streamReadyRef.current = true;
             loadedDocumentIdRef.current = null;
+            syncSelectedVoice(selectedTtsVoice);
             syncSelectedDocument(selectedDocumentId ?? null);
             const uid = crypto.randomUUID();
             activeUserIdRef.current = uid;
@@ -714,6 +780,14 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
             onSnippetExplanation?.(lastAssistantText);
             return;
           }
+          if (payload.type === "doc_note_saved" && payload.snippet) {
+            onDocumentEvent?.({ type: "doc_note_saved", snippet: payload.snippet as never });
+            return;
+          }
+          if (payload.type === "doc_highlight_saved") {
+            onDocumentEvent?.({ type: "doc_highlight_saved", sentence_idx: payload.sentence_idx ?? 0, color: payload.color });
+            return;
+          }
           if (payload.type === "doc_search_start") {
             onDocumentEvent?.({ type: "doc_search_start", query: payload.query ?? "" });
             return;
@@ -752,7 +826,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
         };
 
         try {
-          await transport.connect(stream);
+          await transport.connect(stream, { voice: selectedTtsVoice });
         } catch (connectErr) {
           if (startAttemptRef.current !== startAttemptId) {
             transport.close();
@@ -908,6 +982,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
         if (payload.type === "ready") {
           streamReadyRef.current = true;
           loadedDocumentIdRef.current = null;
+          syncSelectedVoice(selectedTtsVoice);
           syncSelectedDocument(selectedDocumentId ?? null);
           // Create the user message bubble for this recording session
           const uid = crypto.randomUUID();
@@ -1122,6 +1197,14 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
           onSnippetExplanation?.(pendingAssistantTextRef.current);
           return;
         }
+        if (payload.type === "doc_note_saved" && payload.snippet) {
+          onDocumentEvent?.({ type: "doc_note_saved", snippet: payload.snippet as never });
+          return;
+        }
+        if (payload.type === "doc_highlight_saved") {
+          onDocumentEvent?.({ type: "doc_highlight_saved", sentence_idx: payload.sentence_idx ?? 0, color: payload.color });
+          return;
+        }
         if (payload.type === "doc_search_start") {
           onDocumentEvent?.({ type: "doc_search_start", query: payload.query ?? "" });
           return;
@@ -1213,6 +1296,72 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
     if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
   }, []);
 
+  const syncSelectedVoice = useCallback((voice: string) => {
+    if (!streamReadyRef.current) {
+      return;
+    }
+    sendToBackend({ type: "tts_voice", voice });
+  }, [sendToBackend]);
+
+  useEffect(() => {
+    syncSelectedVoice(selectedTtsVoice);
+  }, [selectedTtsVoice, syncSelectedVoice]);
+
+  const stopVoicePreview = useCallback(() => {
+    previewAudioRef.current?.pause();
+    previewAudioRef.current = null;
+    if (previewAudioUrlRef.current) {
+      URL.revokeObjectURL(previewAudioUrlRef.current);
+      previewAudioUrlRef.current = null;
+    }
+    setPreviewingVoice(null);
+  }, []);
+
+  const previewVoice = useCallback(async (voiceId: string) => {
+    if (isRecordingRef.current || isConnecting || mode === "speaking") {
+      return;
+    }
+    stopVoicePreview();
+    setVoicePreviewError(null);
+    setPreviewingVoice(voiceId);
+
+    try {
+      const response = await fetch(`${backendUrl}/tts/preview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ voice: voiceId }),
+      });
+      if (!response.ok) {
+        throw new Error("Voice preview failed.");
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      previewAudioUrlRef.current = url;
+      previewAudioRef.current = audio;
+      audio.onended = () => {
+        if (previewAudioRef.current === audio) {
+          stopVoicePreview();
+        }
+      };
+      audio.onerror = () => {
+        if (previewAudioRef.current === audio) {
+          setVoicePreviewError("Preview playback failed.");
+          stopVoicePreview();
+        }
+      };
+      await audio.play();
+    } catch (err) {
+      setVoicePreviewError(err instanceof Error ? err.message : "Voice preview failed.");
+      stopVoicePreview();
+    }
+  }, [isConnecting, mode, stopVoicePreview]);
+
+  const selectVoice = useCallback((voiceId: string) => {
+    setSelectedTtsVoice(voiceId);
+    void previewVoice(voiceId);
+  }, [previewVoice]);
+
   const syncSelectedDocument = useCallback((docId: string | null) => {
     if (!streamReadyRef.current) {
       return;
@@ -1294,6 +1443,8 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
   const orbCoreScale = (1 + amplitude * 0.34).toFixed(3);
   const orbDriftX = `${(amplitude * 12).toFixed(2)}px`;
   const orbDriftY = `${(amplitude * -10).toFixed(2)}px`;
+  const selectedVoice = ttsVoices.find((voice) => voice.id === selectedTtsVoice) ?? ttsVoices[0] ?? FALLBACK_TTS_VOICES[0];
+  const voicePreviewDisabled = isRecording || isConnecting || mode === "speaking";
 
   return (
     <main className="console-shell">
@@ -1303,25 +1454,18 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
         <header className="topbar surface">
           <div>
             <p className="kicker">Your AI powered reading companion</p>
-            <h1>Lucid AI</h1>
+            <h1>NeuroTalk</h1>
           </div>
           <div className="topbar-meta">
-            <div className="transport-toggle" aria-label="Select audio transport">
-              <button
-                type="button"
-                className={`transport-btn${transportType === "webrtc" ? " is-active" : ""}`}
-                disabled={isRecording || isConnecting}
-                onClick={() => setTransportType("webrtc")}
-                title="WebRTC — Opus/RTP over UDP with built-in echo cancellation. Recommended."
-              >WebRTC</button>
-              <button
-                type="button"
-                className={`transport-btn${transportType === "websocket" ? " is-active" : ""}`}
-                disabled={isRecording || isConnecting}
-                onClick={() => setTransportType("websocket")}
-                title="WebSocket — raw PCM fallback. Use if WebRTC fails."
-              >WebSocket</button>
-            </div>
+            <button
+              type="button"
+              className="settings-button"
+              onClick={() => setIsVoiceSettingsOpen(true)}
+              aria-label="Open voice settings"
+            >
+              <span className="settings-button-label">Voice</span>
+              <strong>{selectedVoice.name}</strong>
+            </button>
             <button
               type="button"
               className="theme-toggle"
@@ -1348,6 +1492,66 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
             </button>
           </div>
         </header>
+
+        {isVoiceSettingsOpen && (
+          <div className="settings-overlay" role="presentation" onClick={() => setIsVoiceSettingsOpen(false)}>
+            <section
+              className="voice-settings-panel surface"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="voice-settings-title"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="voice-settings-header">
+                <div>
+                  <p className="kicker">Voice Settings</p>
+                  <h2 id="voice-settings-title">Choose NeuroTalk voice</h2>
+                  <p>Tap any sphere to preview and select the assistant voice.</p>
+                </div>
+                <button
+                  type="button"
+                  className="settings-close-button"
+                  onClick={() => setIsVoiceSettingsOpen(false)}
+                  aria-label="Close voice settings"
+                >
+                  Close
+                </button>
+              </div>
+
+              <div className="voice-orb-grid">
+                {ttsVoices.map((voice, index) => {
+                  const isSelected = voice.id === selectedTtsVoice;
+                  const isPreviewing = previewingVoice === voice.id;
+                  return (
+                    <button
+                      key={voice.id}
+                      type="button"
+                      className={[
+                        "voice-orb-button",
+                        isSelected ? "is-selected" : "",
+                        isPreviewing ? "is-previewing" : "",
+                      ].filter(Boolean).join(" ")}
+                      onClick={() => selectVoice(voice.id)}
+                      data-preview-disabled={voicePreviewDisabled}
+                      style={{ "--voice-index": index } as CSSProperties}
+                      aria-pressed={isSelected}
+                      aria-label={`Select and preview ${voice.name} voice`}
+                    >
+                      <span className="voice-orb-glow" aria-hidden="true" />
+                      <span className="voice-orb-name">{voice.name}</span>
+                      <span className="voice-orb-action">{isPreviewing ? "Playing" : isSelected ? "Selected" : "Preview"}</span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div className="voice-settings-footer">
+                <span>{voicePreviewDisabled ? "Stop the live session to preview voices." : "Preview uses the same backend TTS as document reading."}</span>
+                {voicePreviewError ? <strong>{voicePreviewError}</strong> : null}
+              </div>
+            </section>
+          </div>
+        )}
 
         <div className="console-body">
           {/* ── Orb Zone ─────────────────────────────────────────── */}
@@ -1528,7 +1732,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
 
       <footer className="console-footer">
         <div className="console-footer-inner">
-          <span className="console-footer-brand">Lucid AI</span>
+          <span className="console-footer-brand">NeuroTalk</span>
           <span className="console-footer-sep" aria-hidden="true">·</span>
           <span className="console-footer-tagline">Your AI powered reading companion</span>
           <span className="console-footer-sep" aria-hidden="true">·</span>

@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, type ReactNode, useEffect, useRef, useState, useCallback } from "react";
+import { Fragment, type CSSProperties, type ReactNode, useEffect, useRef, useState, useCallback } from "react";
 import { DocumentUploader } from "./document-uploader";
 import { SearchResultPopup } from "./search-result-popup";
 
@@ -40,6 +40,8 @@ export type DocumentEvent =
   | { type: "doc_opened"; doc_id: string; title: string; raw_markdown: string; sentences: string[]; annotations: { highlights: Annotation[]; snippets: Snippet[] } }
   | { type: "doc_highlight"; sentence_idx: number; word_count: number }
   | { type: "doc_save_snippet"; term: string; sentence_idx?: number }
+  | { type: "doc_note_saved"; snippet: Snippet }
+  | { type: "doc_highlight_saved"; sentence_idx: number; color?: string }
   | { type: "doc_search_start"; query: string }
   | { type: "doc_search_result"; query: string; results: SearchResult[] }
   | { type: "doc_export"; format: string; download_url: string }
@@ -174,11 +176,24 @@ type MarkdownRendererOptions = {
   sentenceTexts: string[];
   activeSentenceIdx: number | null;
   activeWordIdx: number | null;
+  snippetsBySentence: Map<number, Snippet[]>;
+  highlightsBySentence: Map<number, string>;
+  openSnippetId: string | null;
+  onToggleSnippet: (snippetId: string) => void;
   registerSentenceRef: (sentenceIdx: number, element: HTMLElement | null) => void;
 };
 
 function renderMarkdownDocument(rawMarkdown: string, options: MarkdownRendererOptions): ReactNode[] {
-  const { sentenceTexts, activeSentenceIdx, activeWordIdx, registerSentenceRef } = options;
+  const {
+    sentenceTexts,
+    activeSentenceIdx,
+    activeWordIdx,
+    snippetsBySentence,
+    highlightsBySentence,
+    openSnippetId,
+    onToggleSnippet,
+    registerSentenceRef,
+  } = options;
   const lines = rawMarkdown.replace(/\r\n/g, "\n").split("\n");
   const nodes: ReactNode[] = [];
   let sentenceCursor = 0;
@@ -225,6 +240,8 @@ function renderMarkdownDocument(rawMarkdown: string, options: MarkdownRendererOp
     return segments.map((segment, index) => {
       const sentenceIdx = segment.sentenceIdx < sentenceTexts.length ? segment.sentenceIdx : null;
       const isActive = sentenceIdx !== null && sentenceIdx === activeSentenceIdx;
+      const sentenceSnippets = sentenceIdx !== null ? snippetsBySentence.get(sentenceIdx) ?? [] : [];
+      const highlightColor = sentenceIdx !== null ? highlightsBySentence.get(sentenceIdx) : undefined;
       const segmentWords = segment.text.split(/\s+/);
       const key = `${keyPrefix}-segment-${index}`;
 
@@ -232,7 +249,13 @@ function renderMarkdownDocument(rawMarkdown: string, options: MarkdownRendererOp
         <Fragment key={key}>
           <span
             ref={sentenceIdx !== null ? (element) => registerSentenceRef(sentenceIdx, element) : undefined}
-            className={isActive ? "doc-md-segment doc-md-segment--active" : "doc-md-segment"}
+            className={[
+              "doc-md-segment",
+              isActive ? "doc-md-segment--active" : "",
+              highlightColor ? "doc-md-segment--highlighted" : "",
+              sentenceSnippets.length ? "doc-md-segment--noted" : "",
+            ].filter(Boolean).join(" ")}
+            style={highlightColor ? { "--highlight-color": highlightColor } as CSSProperties : undefined}
             data-sentence-idx={sentenceIdx ?? undefined}
           >
             {isActive
@@ -245,7 +268,30 @@ function renderMarkdownDocument(rawMarkdown: string, options: MarkdownRendererOp
                     {wordIndex < segmentWords.length - 1 ? " " : ""}
                   </span>
                 ))
-              : segment.text}
+              : renderInlineMarkdown(segment.text, `${key}-inline`)}
+            {sentenceSnippets.length ? (
+              <span className="doc-note-anchor">
+                {sentenceSnippets.map((snippet) => (
+                  <button
+                    key={snippet.id}
+                    type="button"
+                    className="doc-snippet-indicator"
+                    onClick={() => onToggleSnippet(snippet.id)}
+                    aria-label="Open saved note"
+                  >
+                    note
+                  </button>
+                ))}
+                {sentenceSnippets.map((snippet) => (
+                  openSnippetId === snippet.id ? (
+                    <span key={`${snippet.id}-tooltip`} className="doc-snippet-tooltip" role="dialog">
+                      <strong>{snippet.term}</strong>
+                      <span>{snippet.explanation}</span>
+                    </span>
+                  ) : null
+                ))}
+              </span>
+            ) : null}
           </span>
           {index < segments.length - 1 ? " " : ""}
         </Fragment>
@@ -412,7 +458,9 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
   const [docTitle, setDocTitle] = useState<string>("");
   const [activeSentenceIdx, setActiveSentenceIdx] = useState<number | null>(null);
   const [activeWordIdx, setActiveWordIdx] = useState<number | null>(null);
-  const [snippets, setSnippets] = useState<Map<number, Snippet>>(new Map());
+  const [snippets, setSnippets] = useState<Map<number, Snippet[]>>(new Map());
+  const [highlights, setHighlights] = useState<Map<number, string>>(new Map());
+  const [openSnippetId, setOpenSnippetId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState<string | null>(null);
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [isSearchLoading, setIsSearchLoading] = useState(false);
@@ -437,6 +485,7 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
 
   useEffect(() => {
     sentenceRefs.current.clear();
+    setOpenSnippetId(null);
   }, [rawMarkdown, selectedDocId]);
 
   useEffect(() => {
@@ -465,6 +514,14 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
         void loadDocumentDetail(event.doc_id).then((data) => {
           if (!data) return;
           setRawMarkdown(data.raw_markdown ?? "");
+          setHighlights(new Map((data.annotations?.highlights ?? []).map((item: Annotation) => [item.sentence_idx, item.color ?? "yellow"])));
+          const nextSnippets = new Map<number, Snippet[]>();
+          for (const snippet of data.annotations?.snippets ?? []) {
+            const list = nextSnippets.get(snippet.sentence_idx) ?? [];
+            list.push(snippet);
+            nextSnippets.set(snippet.sentence_idx, list);
+          }
+          setSnippets(nextSnippets);
         });
       }
     } else if (event.type === "doc_opened") {
@@ -473,6 +530,14 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
       setDocTitle(event.title);
       setSelectedDocId(event.doc_id);
       onSelectionChange?.(event.doc_id);
+      setHighlights(new Map((event.annotations?.highlights ?? []).map((item) => [item.sentence_idx, item.color ?? "yellow"])));
+      const nextSnippets = new Map<number, Snippet[]>();
+      for (const snippet of event.annotations?.snippets ?? []) {
+        const list = nextSnippets.get(snippet.sentence_idx) ?? [];
+        list.push(snippet);
+        nextSnippets.set(snippet.sentence_idx, list);
+      }
+      setSnippets(nextSnippets);
     } else if (event.type === "doc_highlight") {
       // `doc_highlight` is emitted when the server is about to stream a sentence.
       // The actual visible reading cursor should follow playback start via
@@ -488,6 +553,20 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
       setIsReading(false);
     } else if (event.type === "doc_reading_resume") {
       setIsReading(true);
+    } else if (event.type === "doc_note_saved") {
+      setSnippets((prev) => {
+        const next = new Map(prev);
+        const list = next.get(event.snippet.sentence_idx) ?? [];
+        next.set(event.snippet.sentence_idx, [...list, event.snippet]);
+        return next;
+      });
+      setOpenSnippetId(event.snippet.id);
+    } else if (event.type === "doc_highlight_saved") {
+      setHighlights((prev) => {
+        const next = new Map(prev);
+        next.set(event.sentence_idx, event.color ?? "yellow");
+        return next;
+      });
     } else if (event.type === "doc_search_start") {
       setSearchQuery(event.query);
       setSearchResults([]);
@@ -518,7 +597,12 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
     })
       .then((r) => r.json())
       .then((sn: Snippet) => {
-        setSnippets((prev) => new Map(prev).set(idx, sn));
+        setSnippets((prev) => {
+          const next = new Map(prev);
+          const list = next.get(idx) ?? [];
+          next.set(idx, [...list, sn]);
+          return next;
+        });
       })
       .catch(() => {});
   }, [pendingSnippetTerm, pendingSnippetExplanation, selectedDocId, activeSentenceIdx, activeWordIdx]);
@@ -543,6 +627,14 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
     setDocTitle(data.title);
     setActiveSentenceIdx(null);
     setActiveWordIdx(null);
+    setHighlights(new Map((data.annotations?.highlights ?? []).map((item: Annotation) => [item.sentence_idx, item.color ?? "yellow"])));
+    const nextSnippets = new Map<number, Snippet[]>();
+    for (const snippet of data.annotations?.snippets ?? []) {
+      const list = nextSnippets.get(snippet.sentence_idx) ?? [];
+      list.push(snippet);
+      nextSnippets.set(snippet.sentence_idx, list);
+    }
+    setSnippets(nextSnippets);
   }, [loadDocumentDetail, onSelectionChange]);
 
   const handleDeleteDoc = useCallback(async (docId: string) => {
@@ -584,11 +676,18 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
   const registerSentenceRef = useCallback((sentenceIdx: number, element: HTMLElement | null) => {
     sentenceRefs.current.set(sentenceIdx, element);
   }, []);
+  const toggleSnippet = useCallback((snippetId: string) => {
+    setOpenSnippetId((current) => current === snippetId ? null : snippetId);
+  }, []);
   const markdownNodes = rawMarkdown
     ? renderMarkdownDocument(rawMarkdown, {
         sentenceTexts: sentences,
         activeSentenceIdx,
         activeWordIdx,
+        snippetsBySentence: snippets,
+        highlightsBySentence: highlights,
+        openSnippetId,
+        onToggleSnippet: toggleSnippet,
         registerSentenceRef,
       })
     : null;

@@ -1,4 +1,5 @@
 {
+  "model_type": "kokoro",
   "istftnet": {
     "upsample_kernel_sizes": [20, 12],
     "upsample_rates": [10, 6],

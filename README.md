@@ -1,4 +1,4 @@
-# LucidAI
+# NeuroTalk
 
 > Read aloud. Ask anything. Remember everything.
 
@@ -65,18 +65,17 @@ make dev
 
 > **Linux:** replace `brew install libsrtp` with `apt-get install libsrtp2-dev` (Debian/Ubuntu).
 
-## Transports
+## Transport
 
-Docent supports two transport modes selectable in the UI:
+NeuroTalk uses WebRTC as the customer-facing live voice transport:
 
 | Mode | Audio path | Signalling |
 |------|-----------|------------|
 | **WebRTC** (default) | Browser mic → Opus RTP → UDP → aiortc → PCM 16kHz | RTCDataChannel (JSON) |
-| **WebSocket** | Browser mic → Float32 PCM → WebSocket binary frames | Same WebSocket (JSON) |
 
-WebRTC is recommended: browser-native echo cancellation, noise suppression, and auto-gain control are applied before encoding. The data channel carries the same JSON protocol as the WebSocket path, so the frontend message handler is shared between both modes.
+WebRTC is recommended because browser-native echo cancellation, noise suppression, and auto-gain control are applied before encoding. WebSocket remains in the codebase as an internal fallback/debug path, but the UI presents WebRTC only.
 
-The frontend exposes a transport toggle, and the WebRTC path keeps a long-lived peer connection open so follow-up turns reuse the same session instead of reconnecting every request.
+The WebRTC path keeps a long-lived peer connection open so follow-up turns reuse the same session instead of reconnecting every request.
 
 ## Environment Variables
 
@@ -85,12 +84,14 @@ Copy `backend/.env.example` → `backend/.env` and adjust as needed.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `STT_MODEL_SIZE` | `small` | Whisper model (`tiny.en` → `large-v3`) |
+| `STT_MODEL_PATH` | `models/stt` | Local faster-whisper model directory used instead of downloading from Hugging Face |
 | `STT_DEVICE` | `cpu` | `cpu` or `cuda` |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL |
 | `LLM_MODEL` | `llama3.2:3b` | Any model pulled via `ollama pull` |
 | `LLM_MAX_TOKENS` | `100` | Max tokens per LLM response |
 | `LLM_MAX_HISTORY_TURNS` | `6` | Conversation turns kept in context |
 | `TTS_BACKEND` | `kokoro` | TTS engine — see below |
+| `TTS_MODEL_PATH` | `models/tts` | Local Kokoro model directory and voices used instead of downloading from Hugging Face |
 | `STREAM_EMIT_INTERVAL_MS` | `250` | Minimum gap between partial STT emits |
 | `STREAM_MIN_AUDIO_MS` | `300` | Minimum buffered audio before STT runs |
 | `STREAM_LLM_MIN_CHARS` | `8` | Minimum transcript length before starting the LLM |
@@ -100,11 +101,11 @@ Copy `backend/.env.example` → `backend/.env` and adjust as needed.
 | `STREAM_VAD_MIN_SILENCE_MS` | `600` | Required silence before VAD emits speech end |
 | `STREAM_VAD_SPEECH_PAD_MS` | `200` | Extra speech padding kept around VAD boundaries |
 | `STREAM_VAD_FRAME_SAMPLES` | `512` | Frame size fed into the streaming VAD at 16 kHz |
-| `WELCOME_MESSAGE` | `Hello! I'm Docent, your AI reading companion...` | Spoken greeting streamed on session start; empty disables it |
+| `WELCOME_MESSAGE` | `Hello! I'm your NeuroTalk voice assistant...` | Spoken greeting streamed on session start; empty disables it |
 
 ## Switching LLM Models
 
-Docent uses Ollama for local LLM inference. Switching models is one line.
+NeuroTalk uses Ollama for local LLM inference. Switching models is one line.
 
 **Available models (fast → quality):**
 
@@ -139,7 +140,7 @@ LLM_MODEL=qwen3:4b make backend
 
 ## Switching STT Models
 
-Docent uses `faster-whisper` for speech recognition.
+NeuroTalk uses `faster-whisper` for speech recognition.
 
 **Whisper model sizes:**
 

@@ -1,41 +1,14 @@
 So, currently, you are seeing repo which does voice agent So using this voice agent, I want to build a project which does below things. First, you upload a document in markdown format. 
-   In right panel, you will show uploaded document And in left panel, you will have a voice assistant once document is uploaded, you speak with agent and you ask the agent can you see    
-  the document uploaded? Agent checks the in the back end. And list down the file files by speaking about it. And it will ask which document you want to want me to read. So user will     
-  select the document. Which they want to want agent to read. So in right panel, document will be surfaced. And left panel agent will start reading that document. Word by word and that   
-  wherever that document is getting read, it will be highlighted as well. And while reading, if user finds difficult to understand the terminology or that word he will ask agent to       
-  answer about it. Based on the question user asks, agent will either answer directly or it will search Internet and ask answer it. So that snippet of word, it will pop up. And it will   
-  read out loud. So user if finds finds it interesting and he understands it, he will ask agent to save it So agent needs to save that snippet along with that document. When they click   
-  on that word, it should pop up. And, also, if user asks some sentence to highlight, it needs to highlight it. So just consider this as similar to scenario where where user interacts    
-  with the teacher. And asks your doubts And also user is reading a book and he highlights that sentence find he finds very important. So once everything is done, agent needs to save     
-  that document along with highlighted sentence and and for a particular word, or whatever agent has searched in Internet and on some query user queries, It can you can save it in a PDF  
-  or you can save it as a docx as well. This is the high level idea which I want to build. Based on this, create complete implementation plan. And save it in docs folder. 
-
-     10 Name + Tagline Options                                                                                                                                   
-                                                                                                                                                              
-  ┌─────┬────────────┬──────────────────────────────────────────────────┐                                                                                     
-  │  #  │    Name    │                     Tagline                      │                                                                                     
-  ├─────┼────────────┼──────────────────────────────────────────────────┤                                                                                     
-  │ 1   │ Docent     │ Read aloud. Ask anything. Remember everything.   │                                                                                     
-  ├─────┼────────────┼──────────────────────────────────────────────────┤
-  │ 2   │ Lector     │ Your AI-powered reading companion.               │                                                                                     
-  ├─────┼────────────┼──────────────────────────────────────────────────┤                                                                                     
-  │ 3   │ Folio      │ Documents that speak for themselves.             │                                                                                     
-  ├─────┼────────────┼──────────────────────────────────────────────────┤                                                                                     
-  │ 4   │ Narrato    │ Every document has a voice.                      │                                                        
-  ├─────┼────────────┼──────────────────────────────────────────────────┤                                                                                     
-  │ 5   │ Verbatim   │ Hear every word. Understand every concept.       │                 
-  ├─────┼────────────┼──────────────────────────────────────────────────┤                                                                                     
-  │ 6   │ Marginalia │ Read deeper. Note smarter.                       │                                                        
-  ├─────┼────────────┼──────────────────────────────────────────────────┤                                                                                     
-  │ 7   │ Lexis      │ Voice-powered comprehension, one page at a time. │                                                        
-  ├─────┼────────────┼──────────────────────────────────────────────────┤                                                                                     
-  │ 8   │ Vox        │ Listen. Ask. Annotate.                           │                 
-  ├─────┼────────────┼──────────────────────────────────────────────────┤                                                                                     
-  │ 9   │ Lucid      │ Read, ask, and truly understand.                 │                                                        
-  ├─────┼────────────┼──────────────────────────────────────────────────┤                                                                                     
-  │ 10  │ Scriptor   │ Your voice-guided reading assistant.             │                                                        
-  └─────┴────────────┴──────────────────────────────────────────────────┘                                                                                     
-                                                                               
+In right panel, you will show uploaded document And in left panel, you will have a voice assistant once document is uploaded, you speak with agent and you ask the agent can you see    
+the document uploaded? Agent checks the in the back end. And list down the file files by speaking about it. And it will ask which document you want to want me to read. So user will     
+select the document. Which they want to want agent to read. So in right panel, document will be surfaced. And left panel agent will start reading that document. Word by word and that   
+wherever that document is getting read, it will be highlighted as well. And while reading, if user finds difficult to understand the terminology or that word he will ask agent to       
+answer about it. Based on the question user asks, agent will either answer directly or it will search Internet and ask answer it. So that snippet of word, it will pop up. And it will   
+read out loud. So user if finds finds it interesting and he understands it, he will ask agent to save it So agent needs to save that snippet along with that document. When they click   
+on that word, it should pop up. And, also, if user asks some sentence to highlight, it needs to highlight it. So just consider this as similar to scenario where where user interacts    
+with the teacher. And asks your doubts And also user is reading a book and he highlights that sentence find he finds very important. So once everything is done, agent needs to save     
+that document along with highlighted sentence and and for a particular word, or whatever agent has searched in Internet and on some query user queries, It can you can save it in a PDF  
+or you can save it as a docx as well. This is the high level idea which I want to build. Based on this, create complete implementation plan. And save it in docs folder.     
 
 I hope this is how backend is designed - 1) For any user queries, it uses LLM to answer. LLM takes all uploaded document names (just list of uploaded doc
 names) in its context always. when user clicks or selects any specific document that signal goes to LLLM context as user selected document (so llm knows
@@ -46,3 +19,12 @@ or words like (i didnt understand for example what do you mean by transformers) 
 around those words from uploaded document as context which user is asking question) and if user says keep reading document then LLM should set document read flag in 
 json and tts should keep reading where it left. 3) Text reading in document reader should be highlighted on word
 tts model is streaming voice keeping it in sync.4)If required change prompt used for LLM
+
+
+1) Improve the overall design and feel of this app [Image #1]. Make it more professional and customer facing. 2) When user interrupts asking question LLM
+needs to have history of doument it is reading upto certain number of sentences and based on that if user asks questions not understanding it it needs to
+answer it. 3) Once agent answers user query and user asks to continue reading the document where they left before it needs to continue reading the document
+along with highilighting word it is reading on docuemnt reader way it was doing before. 4) when user asks to save notes (which agent answered to user query
+where user was not understanding specific sentence in document) for a sentence it needs to save it and have hyperlink attached to that sentence in document
+reader. when clicked on that sentence notes should pop up. 5) Also user might asks agent to highlight the sentence which they feel is important that needs
+to be highlighted using different color.

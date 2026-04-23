@@ -18,11 +18,12 @@ from app.services.document_store import get_document_store
 from app.services.llm import complete_llm_response
 from app.services.search import web_search
 from app.services.stt import get_stt_service
-from app.services.tts import get_tts_service
+from app.services.tts import get_available_tts_voices, get_default_tts_voice, get_tts_service
 from app.services.vad import StreamingVAD, get_vad_service
 from app.utils.document_turns import (
     DocumentTurnDecision,
     build_document_turn_context,
+    detect_direct_read_intent,
     parse_document_turn_response,
     resolve_document_by_name,
     user_explicitly_named_document,
@@ -69,7 +70,7 @@ class WebRTCSession:
         session_id: Short hex ID shared with the frontend as `request_id`.
     """
 
-    def __init__(self, session_id: str) -> None:
+    def __init__(self, session_id: str, initial_voice: str | None = None) -> None:
         self.session_id = session_id
         self._settings = get_settings()
         self.pc = RTCPeerConnection(_RTC_CONFIG)
@@ -98,6 +99,8 @@ class WebRTCSession:
         self._active_document_id: str | None = None
         self._last_read_sentence_idx: int = -1
         self._resume_from_sentence_idx: int | None = None
+        self._last_answer_text: str = ""
+        self._tts_voice: str = self._resolve_tts_voice(initial_voice)
 
         # Barge-in state
         self._is_agent_speaking = False
@@ -112,6 +115,12 @@ class WebRTCSession:
 
 
         self._register_pc_handlers()
+
+    def _resolve_tts_voice(self, voice: str | None) -> str:
+        valid_voices = {item["id"] for item in get_available_tts_voices()}
+        if voice and voice in valid_voices:
+            return voice
+        return get_default_tts_voice()
 
     # ── Peer-connection lifecycle ────────────────────────────────────────────
 
@@ -178,6 +187,12 @@ class WebRTCSession:
         if event_type == "start":
             # sample_rate from client is informational only — we always resample to 16 kHz
             logger.info("session_id={} event=stream_started", self.session_id)
+
+        elif event_type == "tts_voice":
+            voice = str(payload.get("voice", ""))
+            resolved_voice = self._resolve_tts_voice(voice)
+            self._tts_voice = resolved_voice
+            logger.info("session_id={} event=tts_voice_selected voice={}", self.session_id, resolved_voice)
 
         elif event_type == "interrupt":
             logger.info("session_id={} event=interrupt_received", self.session_id)
@@ -585,7 +600,7 @@ class WebRTCSession:
                 break
             tts_text, sentence_idx, display_text = item
             try:
-                wav_bytes, sr = await tts_service.synthesize(tts_text)
+                wav_bytes, sr = await tts_service.synthesize(tts_text, voice=self._tts_voice)
             except Exception as err:
                 logger.warning(
                     "session_id={} event=tts_error error={}", self.session_id, err
@@ -726,6 +741,22 @@ class WebRTCSession:
         call_error: str | None = None
 
         try:
+            direct_read = detect_direct_read_intent(text)
+            if direct_read and self._active_document_id:
+                if direct_read.restart_from_beginning:
+                    self._last_read_sentence_idx = -1
+                    self._resume_from_sentence_idx = None
+                elif direct_read.action == "continue_reading" and self._resume_from_sentence_idx is None and self._last_read_sentence_idx < 0:
+                    self._resume_from_sentence_idx = 0
+                display_response = await self._run_document_read(
+                    doc_id=self._active_document_id,
+                    user_text=text,
+                    start_idx=self._get_read_start_idx(restart_from_beginning=direct_read.restart_from_beginning),
+                    llm_ms=0.0,
+                )
+                call_error = None
+                return
+
             document_context = build_document_turn_context(
                 user_text=text,
                 active_document_id=self._active_document_id,
@@ -827,6 +858,52 @@ class WebRTCSession:
                                 start_idx=self._get_read_start_idx(restart_from_beginning=decision.restart_from_beginning),
                                 llm_ms=llm_ms,
                             )
+                elif decision.action == "save_note":
+                    sentence_idx = decision.sentence_idx
+                    if sentence_idx is None or sentence_idx < 0:
+                        sentence_idx = max(0, self._last_read_sentence_idx)
+                    note_text = decision.note_text or self._last_answer_text or decision.response_text
+                    if not self._active_document_id or not note_text:
+                        response_text = "I do not have a note to save yet."
+                    else:
+                        snippet = get_document_store().save_snippet(
+                            doc_id=self._active_document_id,
+                            term="AI note",
+                            explanation=note_text,
+                            sentence_idx=sentence_idx,
+                            word_idx=-1,
+                        )
+                        await self._send_json({"type": "doc_note_saved", "snippet": snippet})
+                        response_text = decision.response_text or "Saved that note on the sentence."
+                    await self._play_tts_turn(
+                        user_text=text,
+                        display_text=response_text,
+                        utterances=self._split_text_for_tts(response_text),
+                        llm_ms=llm_ms,
+                    )
+                    display_response = response_text
+                elif decision.action == "highlight_sentence":
+                    sentence_idx = decision.sentence_idx
+                    if sentence_idx is None or sentence_idx < 0:
+                        sentence_idx = max(0, self._last_read_sentence_idx)
+                    color = decision.highlight_color or "yellow"
+                    if not self._active_document_id:
+                        response_text = "I need an open document before I can highlight a sentence."
+                    else:
+                        get_document_store().save_highlight(self._active_document_id, sentence_idx, color)
+                        await self._send_json({
+                            "type": "doc_highlight_saved",
+                            "sentence_idx": sentence_idx,
+                            "color": color,
+                        })
+                        response_text = decision.response_text or "Highlighted that sentence."
+                    await self._play_tts_turn(
+                        user_text=text,
+                        display_text=response_text,
+                        utterances=self._split_text_for_tts(response_text),
+                        llm_ms=llm_ms,
+                    )
+                    display_response = response_text
                 else:
                     response_text = decision.response_text or "I'm not sure how to help with that yet."
                     await self._play_tts_turn(
@@ -865,6 +942,8 @@ class WebRTCSession:
 
         if display_response and call_error is None and not self._interrupt_event.is_set():
             self._llm_responded = True
+            if not display_response.startswith("Reading "):
+                self._last_answer_text = display_response
             self._conversation_history.append({"role": "user", "content": text})
             self._conversation_history.append({"role": "assistant", "content": display_response})
             max_msgs = self._settings.llm_max_history_turns * 2

@@ -10,6 +10,12 @@ from app.models import DebugInfo, LatencyMetrics
 from app.utils.module_logging import log_module_io
 from config.settings import Settings, get_settings
 
+_BACKEND_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _resolve_model_path(path: Path) -> Path:
+    return path if path.is_absolute() else _BACKEND_ROOT / path
+
 
 @dataclass
 class ServiceResult:
@@ -27,15 +33,19 @@ class SpeechToTextService:
         if self._model is not None:
             return self._model, 0.0
 
+        model_path = _resolve_model_path(self.settings.stt_model_path)
         logger.info(
-            "event=model_load_started model_size={} device={} compute_type={}",
+            "event=model_load_started model_path={} model_size={} device={} compute_type={}",
+            model_path,
             self.settings.stt_model_size,
             self.settings.stt_device,
             self.settings.stt_compute_type,
         )
+        if not model_path.exists():
+            raise FileNotFoundError(f"Local STT model path not found: {model_path}")
         started_at = perf_counter()
         self._model = WhisperModel(
-            self.settings.stt_model_size,
+            str(model_path),
             device=self.settings.stt_device,
             compute_type=self.settings.stt_compute_type,
         )
@@ -98,7 +108,7 @@ class SpeechToTextService:
                 audio_bytes=audio_bytes,
                 detected_language=info.language,
                 segments=len(segment_list),
-                model_size=self.settings.stt_model_size,
+                model_size=str(_resolve_model_path(self.settings.stt_model_path)),
                 device=self.settings.stt_device,
                 compute_type=self.settings.stt_compute_type,
             ),

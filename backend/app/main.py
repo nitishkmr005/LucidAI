@@ -8,9 +8,10 @@ from pathlib import Path
 from time import perf_counter
 from uuid import uuid4
 
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
+from pydantic import BaseModel
 
 from app.models import HealthResponse, TranscriptionResponse
 from app.routers.documents import router as documents_router
@@ -18,11 +19,12 @@ from app.services.document_store import get_document_store
 from app.services.llm import complete_llm_response
 from app.services.search import web_search
 from app.services.stt import get_stt_service
-from app.services.tts import get_tts_service
+from app.services.tts import get_available_tts_voices, get_default_tts_voice, get_tts_service
 from app.services.vad import get_vad_service
 from app.utils.document_turns import (
     DocumentTurnDecision,
     build_document_turn_context,
+    detect_direct_read_intent,
     parse_document_turn_response,
     resolve_document_by_name,
     user_explicitly_named_document,
@@ -50,6 +52,13 @@ _READ_FROM_BEGINNING_PATTERN = re.compile(
     r"\b(read|start reading|read aloud|resume reading|continue reading)\b.*\b(beginning|start|top)\b|\bstart over\b|\brestart\b",
     re.IGNORECASE,
 )
+_TTS_PREVIEW_TEXT = "Welcome to NeuroTalk. This is the selected reading voice."
+_TTS_PREVIEW_MAX_CHARS = 160
+
+
+class TTSPreviewRequest(BaseModel):
+    voice: str | None = None
+    text: str | None = None
 
 app = FastAPI(title=settings.app_name, version="0.1.0")
 app.include_router(webrtc_router)
@@ -109,6 +118,25 @@ async def startup_event() -> None:
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     return HealthResponse()
+
+
+@app.get("/tts/voices")
+async def list_tts_voices() -> dict[str, object]:
+    return {
+        "default_voice": get_default_tts_voice(),
+        "voices": get_available_tts_voices(),
+    }
+
+
+@app.post("/tts/preview")
+async def preview_tts_voice(body: TTSPreviewRequest) -> Response:
+    valid_voices = {item["id"] for item in get_available_tts_voices()}
+    voice = body.voice if body.voice in valid_voices else get_default_tts_voice()
+    preview_text = (body.text or _TTS_PREVIEW_TEXT).strip()[:_TTS_PREVIEW_MAX_CHARS]
+    if not preview_text:
+        preview_text = _TTS_PREVIEW_TEXT
+    wav_bytes, _sample_rate = await get_tts_service().synthesize(preview_text, voice=voice)
+    return Response(content=wav_bytes, media_type="audio/wav")
 
 
 def write_pcm16_wav(*, pcm_bytes: bytes, sample_rate: int, file_path: Path) -> float:
@@ -235,6 +263,8 @@ async def transcribe_stream(websocket: WebSocket) -> None:
     active_document_id: str | None = None  # currently loaded document
     last_read_sentence_idx: int = -1       # last sentence index highlighted during reading
     resume_from_sentence_idx: int | None = None
+    selected_tts_voice: str = get_default_tts_voice()
+    last_answer_text: str = ""
 
     # ── Session log scaffolding ───────────────────────────────────────────────
     session_log = SessionLog(
@@ -287,7 +317,7 @@ async def transcribe_stream(websocket: WebSocket) -> None:
             tts_text, sentence_idx, display_text = item
             synth_started_at = perf_counter()
             try:
-                wav_bytes, sr = await tts_service.synthesize(tts_text)
+                wav_bytes, sr = await tts_service.synthesize(tts_text, voice=selected_tts_voice)
             except Exception as tts_err:
                 session_log.tts_calls.append(
                     TTSCallLog(
@@ -432,7 +462,7 @@ async def transcribe_stream(websocket: WebSocket) -> None:
 
     async def run_llm_stream(text: str, trigger: str) -> None:
         nonlocal llm_task, pending_llm_call, latest_llm_input, last_text_sent, chunk_count, last_emit_at
-        nonlocal llm_responded, active_document_id, last_read_sentence_idx, resume_from_sentence_idx
+        nonlocal llm_responded, active_document_id, last_read_sentence_idx, resume_from_sentence_idx, last_answer_text
         llm_responded = False
         # Clear audio buffer — this utterance is captured; next audio is a new turn
         pcm_buffer.clear()
@@ -448,6 +478,21 @@ async def transcribe_stream(websocket: WebSocket) -> None:
         latest_llm_input = text
 
         try:
+            direct_read = detect_direct_read_intent(text)
+            if direct_read and active_document_id:
+                if direct_read.restart_from_beginning:
+                    last_read_sentence_idx = -1
+                    resume_from_sentence_idx = None
+                elif direct_read.action == "continue_reading" and resume_from_sentence_idx is None and last_read_sentence_idx < 0:
+                    resume_from_sentence_idx = 0
+                display_response = await _run_document_read(
+                    doc_id=active_document_id,
+                    user_text=text,
+                    start_idx=_get_read_start_idx(restart_from_beginning=direct_read.restart_from_beginning),
+                    llm_ms=0.0,
+                )
+                return
+
             document_context = build_document_turn_context(
                 user_text=text,
                 active_document_id=active_document_id,
@@ -551,6 +596,52 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                                 start_idx=_get_read_start_idx(restart_from_beginning=decision.restart_from_beginning),
                                 llm_ms=llm_ms,
                             )
+                elif decision.action == "save_note":
+                    sentence_idx = decision.sentence_idx
+                    if sentence_idx is None or sentence_idx < 0:
+                        sentence_idx = max(0, last_read_sentence_idx)
+                    note_text = decision.note_text or last_answer_text or decision.response_text
+                    if not active_document_id or not note_text:
+                        response_text = "I do not have a note to save yet."
+                    else:
+                        snippet = get_document_store().save_snippet(
+                            doc_id=active_document_id,
+                            term="AI note",
+                            explanation=note_text,
+                            sentence_idx=sentence_idx,
+                            word_idx=-1,
+                        )
+                        await send_json({"type": "doc_note_saved", "snippet": snippet})
+                        response_text = decision.response_text or "Saved that note on the sentence."
+                    await _play_tts_turn(
+                        user_text=text,
+                        display_text=response_text,
+                        utterances=_split_text_for_tts(response_text),
+                        llm_ms=llm_ms,
+                    )
+                    display_response = response_text
+                elif decision.action == "highlight_sentence":
+                    sentence_idx = decision.sentence_idx
+                    if sentence_idx is None or sentence_idx < 0:
+                        sentence_idx = max(0, last_read_sentence_idx)
+                    color = decision.highlight_color or "yellow"
+                    if not active_document_id:
+                        response_text = "I need an open document before I can highlight a sentence."
+                    else:
+                        get_document_store().save_highlight(active_document_id, sentence_idx, color)
+                        await send_json({
+                            "type": "doc_highlight_saved",
+                            "sentence_idx": sentence_idx,
+                            "color": color,
+                        })
+                        response_text = decision.response_text or "Highlighted that sentence."
+                    await _play_tts_turn(
+                        user_text=text,
+                        display_text=response_text,
+                        utterances=_split_text_for_tts(response_text),
+                        llm_ms=llm_ms,
+                    )
+                    display_response = response_text
                 else:
                     response_text = decision.response_text or "I'm not sure how to help with that yet."
                     await _play_tts_turn(
@@ -592,6 +683,8 @@ async def transcribe_stream(websocket: WebSocket) -> None:
 
         if display_response and call_error is None and not interrupt_event.is_set():
             llm_responded = True
+            if not display_response.startswith("Reading "):
+                last_answer_text = display_response
             conversation_history.append({"role": "user", "content": text})
             conversation_history.append({"role": "assistant", "content": display_response})
             max_msgs = settings.llm_max_history_turns * 2
@@ -681,6 +774,13 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                 if event_type == "start":
                     sample_rate = int(payload.get("sample_rate", 16000))
                     logger.info("request_id={} event=stream_started sample_rate={}", request_id, sample_rate)
+                    continue
+
+                if event_type == "tts_voice":
+                    voice = str(payload.get("voice", ""))
+                    valid_voices = {item["id"] for item in get_available_tts_voices()}
+                    selected_tts_voice = voice if voice in valid_voices else get_default_tts_voice()
+                    logger.info("request_id={} event=tts_voice_selected voice={}", request_id, selected_tts_voice)
                     continue
 
                 if event_type == "doc_load":

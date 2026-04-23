@@ -18,6 +18,7 @@ _sessions: dict[str, WebRTCSession] = {}
 class OfferBody(BaseModel):
     sdp: str
     type: str
+    voice: str | None = None
 
 
 class OfferResponse(BaseModel):
@@ -45,7 +46,7 @@ async def webrtc_offer(body: OfferBody) -> OfferResponse:
     """
     session_id = uuid4().hex[:8]
     logger.info("session_id={} event=webrtc_offer_received", session_id)
-    session = WebRTCSession(session_id)
+    session = WebRTCSession(session_id, initial_voice=body.voice)
     answer = await session.setup(body.sdp, body.type)
     _sessions[session_id] = session
     logger.info("session_id={} event=webrtc_answer_sent", session_id)

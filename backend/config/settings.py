@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     # ── STT — faster-whisper ──────────────────────────────────────────────────
     # Model size: tiny | base | small | medium | large-v3
     stt_model_size: str = "small"
+    stt_model_path: Path = Path("models/stt")
     # Device: cpu | cuda | mps
     stt_device: str = "cpu"
     # Compute type: int8 | float16 | float32 (float16/float32 require GPU)
@@ -53,6 +54,7 @@ class Settings(BaseSettings):
     # Backend: kokoro | chatterbox | qwen | vibevoice | omnivoice
     # Must match the installed uv dependency group (e.g. uv sync --group kokoro_model).
     tts_backend: str = "kokoro"
+    tts_model_path: Path = Path("models/tts")
     # Spoken greeting on session start. Set to "" to disable.
     welcome_message: str = "Hello! I'm your Neurotalk voice assistant. How can I assist you today?"
 

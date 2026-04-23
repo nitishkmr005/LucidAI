@@ -1,6 +1,6 @@
-# Docent: End-to-End Audio Pipeline
+# NeuroTalk: End-to-End Audio Pipeline
 
-This article explains every step Docent takes from the moment sound hits your microphone to the moment you hear the agent's reply — and how interruption is handled in between. The two directions are covered separately: **client → server** (your voice going in) and **server → client** (the agent's voice coming back).
+This article explains every step NeuroTalk takes from the moment sound hits your microphone to the moment you hear the agent's reply — and how interruption is handled in between. The two directions are covered separately: **client → server** (your voice going in) and **server → client** (the agent's voice coming back).
 
 ---
 
@@ -47,7 +47,7 @@ Mic hardware
                  └─ sequential playback
 ```
 
-Docent also supports a **WebSocket** transport. In that mode, the browser sends raw Float32 PCM over binary WebSocket frames instead of RTP/WebRTC. The server-side pipeline from STT onward is identical, and the same JSON message schema is used for the return direction. The rest of this article focuses on the WebRTC path, which is the default.
+NeuroTalk uses WebRTC as the customer-facing transport. A WebSocket path remains available as an internal fallback/debug path, but the product UI uses WebRTC by default.
 
 ---
 
@@ -96,7 +96,7 @@ Adding the audio track triggers the browser's codec negotiation machinery. The b
 
 **SDP (Session Description Protocol)** is a text format that describes the session: what codecs are available, what network addresses to try, what encryption keys to use. The browser generates an SDP offer and the server responds with an SDP answer. Together they agree on exactly one codec, one set of ICE candidates, and one DTLS certificate fingerprint before any media flows.
 
-Docent uses **vanilla ICE** (all candidates gathered before the offer is sent):
+NeuroTalk uses **vanilla ICE** (all candidates gathered before the offer is sent):
 
 ```typescript
 // Wait for all ICE candidates to be embedded in the local SDP
@@ -142,7 +142,7 @@ Once the RTC data channel opens, the server immediately sends a `ready` event an
 - **Server-reflexive (srflx) candidates**: the public address seen by a STUN server (tells you what address the NAT gateway maps you to)
 - **Relay candidates**: addresses on a TURN relay server (fallback when direct paths fail)
 
-Docent uses STUN for srflx discovery (`stun.l.google.com:19302`). For localhost and simple NAT environments, host candidates usually succeed directly.
+NeuroTalk uses STUN for srflx discovery (`stun.l.google.com:19302`). For localhost and simple NAT environments, host candidates usually succeed directly.
 
 ICE connectivity checks are STUN binding requests sent on every candidate pair. Once a request and its response arrive successfully, that pair is usable. ICE selects the highest-priority working pair as the nominated path.
 

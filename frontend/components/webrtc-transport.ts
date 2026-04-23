@@ -58,7 +58,7 @@ export class WebRTCTransport {
    * @param stream  MediaStream obtained from ``getUserMedia``.  Its first audio
    *                track is added to the peer connection and sent via RTP.
    */
-  async connect(stream: MediaStream): Promise<void> {
+  async connect(stream: MediaStream, options?: { voice?: string }): Promise<void> {
     this.pc = new RTCPeerConnection({ iceServers: STUN_SERVERS });
 
     // Add mic track → browser will negotiate and send Opus RTP to the server.
@@ -103,6 +103,7 @@ export class WebRTCTransport {
       body: JSON.stringify({
         sdp: this.pc.localDescription!.sdp,
         type: this.pc.localDescription!.type,
+        voice: options?.voice,
       }),
     });
 
