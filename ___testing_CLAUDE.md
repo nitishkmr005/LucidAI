@@ -1,146 +1,140 @@
-# Claude Code — Project Conventions
+# AGENTS.md
 
-Generic conventions for AI agent projects. Copy to any new project and adjust names/values.
+## 🧠 Core Features Contract (Do Not Break)
 
----
+- Agent must always know:
+  - all uploaded documents
+  - currently selected document
+  - and confirm before reading
 
-## Project Layout
+- Document reading must:
+  - use stored content only (never LLM-generated)
+  - stream sequentially (sentence/token order)
+  - support pause and exact resume
 
-```
-project/
-├── backend/          Python backend (FastAPI + uv)
-├── frontend/         Next.js frontend (TypeScript)
-├── scripts/          Standalone learnable .py demos
-├── docs/
-│   └── blog.md       Narrative explanation of the project
-├── README.md         Minimal setup guide
-├── Makefile          dev / setup / check targets
-├── CLAUDE.md         This file
-└── AGENTS.md         Codex / other agent conventions
-```
+- TTS must be streaming with:
+  - real-time word-level highlighting
+  - perfect sync between speech and UI
+  - resume continuing from last position
 
----
+- Interruptions must:
+  - immediately stop TTS
+  - preserve reading state
+  - switch to Q&A without losing context
 
-## Backend Conventions
+- Q&A must:
+  - use recent document context (last N sentences)
+  - avoid generic answers if context exists
+  - optionally use web search if needed
 
-**Package manager:** uv (`uv add <pkg>`, `uv run python ...`). Never `pip` or `poetry`.
+- After Q&A:
+  - "continue" must resume reading exactly where paused
+  - highlighting + TTS must stay in sync
 
-**Python:** 3.11+. Use modern syntax: `X | Y` unions, `match`, `list[str]`.
+- Notes must:
+  - be saved with linked document span
+  - persist across sessions
+  - open via clickable text in document
 
-**Folder roles inside `backend/app/`:**
+- Highlighting must support:
+  - live reading highlight (moving)
+  - user highlight (static, different color)
+  - persistence
 
-| Folder | Purpose |
-|--------|---------|
-| `services/` | External integrations (STT, LLM, TTS, DB). One class or function per file. |
-| `agents/` | Orchestration — chains services together. |
-| `prompts/` | System prompt constants. Never inline prompts in business logic. |
-| `tools/` | LLM tool/function definitions. |
-| `modules/` | Reusable domain modules. |
-| `utils/` | Pure utility functions, no side effects. |
-| `models.py` | Pydantic request/response schemas. |
-| `main.py` | FastAPI app, routes, WebSocket handlers only. |
+- Agent behavior:
+  - must act like a teacher explaining the document
+  - support word, sentence, and concept explanations
 
-**Config pattern:** `pydantic-settings` + `.env` via `config/settings.py`. Never use bare `os.getenv()` in application code.
+- Export must support:
+  - PDF and DOCX
+  - include document + highlights + notes + annotations
 
-**Never commit `.env`.** Always maintain `.env.example` with safe placeholder values.
+- System state must always track:
+  - current_document_id
+  - reading_position (sentence, word)
+  - is_reading
+  - notes
+  - highlights
+  - and must never reset on interruption
 
----
+- LLM must:
+  - handle only Q&A and decisions
+  - not generate full document reading
+  - not control playback or highlighting
 
-## Logging
+- Session must:
+  - remain conversational and continuous
+  - retain context across interactions
 
-Two sinks — distinct purposes, both always set up at startup.
+- UI must always maintain:
+  - left panel → voice agent
+  - right panel → document viewer
+  - real-time highlighting + clickable notes
 
-**Terminal sink** (runtime/human): colorized Loguru output to stdout. Used for live debugging during development. Not persisted.
-
-```python
-logger.add(sys.stdout, colorize=True, format="<green>{time:HH:mm:ss}</green> | <level>{level}</level> | <cyan>{name}</cyan> | <level>{message}</level>")
-```
-
-**JSON file sink** (`backend/logs/`): structured, persistent output for performance analysis, debugging, and LLM call tracing. These are the durable records — not for human reading during dev.
-
-```python
-logger.add("logs/app_{time}.json", serialize=True, rotation="10 MB", retention=5)
-```
-
-Rules:
-- `backend/logs/` — gitignored, `.gitkeep` commits the folder
-- Keep only latest 5 files (`retention=5`)
-- Never use `print()` — always `logger.info / debug / warning / error`
-- Structured key=value pairs: `logger.info("event=llm_done latency_ms={}", ms)`
-- LLM calls must log: model, token count, latency, request ID
-
----
-
-## Frontend Conventions
-
-**Stack:** Next.js 15 · TypeScript · CSS custom properties (no Tailwind unless project uses it).
-
-**Theme system** (when implemented):
-- Tokens in `:root` (light) and `[data-theme="dark"]` blocks in `globals.css`
-- `data-theme` attribute set on `<html>` element
-- Persist preference in localStorage (key: `nt-theme`, values: `"dark"` | `"light"`)
-- Initialize theme with `useState(defaultValue)` — always a stable SSR-safe value — then sync localStorage in `useEffect`. Never use `typeof window` in `useState` initializer (causes hydration mismatch in Next.js App Router).
+- System must:
+  - never lose reading position, notes, or highlights
+  - degrade gracefully on failure
+  - allow resume without restart
 
 ---
 
-## Scripts Folder
+## 🚨 Critical Regression Rule
+Any change that breaks:
+- reading continuity
+- word-level sync
+- interruption handling
+- context-aware Q&A
 
-`scripts/` — standalone, runnable `.py` files. One per module. Teach how each component works in isolation.
+→ must be rejected
 
-Rules:
-- Runs with `uv run --project backend python scripts/<name>.py`
-- No shared imports between scripts — self-contained
-- Docstring at top: what it teaches and how to run it
-- `if __name__ == "__main__":` block with working demo
-- Prints timing output
+## Repository Rules
+- Keep a single `README.md` in the repository root.
+- Keep project documentation inside `docs/`.
+- `docs/` must contain:
+  - `blog.md` written in blog-style format explaining the project
+  - `demo_narrative.md` for stakeholder demo narration
+- Keep all learnable standalone scripts inside `scripts/`.
+- `scripts/` must contain educational scripts for each core important module used in the codebase.
+- Maintain modular project structure so components are easy to replace without large refactors.
 
----
+## Run and Developer Experience
+- Use `make` for one-line developer commands.
+- Starting, checking, and other common workflows must be available through `make`.
+- Prefer simple, predictable developer workflows.
 
-## Deployment
+## Python and Environment
+- Use `uv` for Python dependency and environment management.
+- Do not use `pip`, `poetry`, or other package managers.
+- Use `.env` only for secrets such as passwords and API keys.
+- Do not store non-secret configuration in `.env`.
+- `.venv` and `.env` must be ignored in `.gitignore`.
 
-| Layer | Platform | Notes |
-|-------|----------|-------|
-| Frontend | Vercel | Connect GitHub → set root to `frontend/` → add `NEXT_PUBLIC_BACKEND_URL` env var |
-| Backend | Railway | Connect GitHub → set root to `backend/` → set all `.env.example` vars → expose port |
+## Configuration Rules
+- Keep application configuration in `settings.py` using Pydantic settings.
+- Centralize configuration access through settings objects.
+- Do not scatter configuration across files.
+- Do not read configuration directly from environment variables in application code.
 
----
+## Logging Rules
+- Use `loguru` for all logging.
+- Terminal logs must support development and debugging.
+- Persist structured JSON logs in `logs/`.
+- Keep a maximum of 5 log files through rotation/retention.
+- Logs must support LLM tracing and include:
+  - input
+  - output
+  - latency
+- Do not use `print()` for application logging.
 
-## Authentication
+## Architecture Rules
+- Preserve modular design across the codebase.
+- Separate orchestration, integrations, business logic, configuration, and utilities cleanly.
+- Design the LLM layer so provider swaps are easy.
+- It must be easy to replace Ollama-based LLM calls with Anthropic, OpenAI, or Gemini-based implementations.
+- Avoid provider-specific logic leaking across the codebase.
 
-Use Supabase for user authentication.
-
-- Frontend: `@supabase/supabase-js`, env vars `NEXT_PUBLIC_SUPABASE_URL` + `NEXT_PUBLIC_SUPABASE_ANON_KEY`
-- Backend: verify JWT from `Authorization: Bearer <token>` using Supabase admin client with `SUPABASE_SERVICE_ROLE_KEY`
-- Never expose `SUPABASE_SERVICE_ROLE_KEY` to frontend or commit it
-
----
-
-## Makefile Targets
-
-```makefile
-make setup    # install all deps
-make dev      # start backend + frontend with hot-reload
-make backend  # backend only
-make frontend # frontend only
-make check    # lint + type check
-```
-
----
-
-## Code Style
-
-- Type-annotate all function signatures
-- `async def` for all I/O-bound functions
-- No bare `except:` — always catch specific exceptions
-- Use `loguru`, not `logging`
-- Import order: stdlib → third-party → local (enforced by ruff)
-- No TODO comments in committed code — open a GitHub issue instead
-- Write acceptance criteria in claude.md file 
-
----
-
-## .gitignore Essentials
-
-Ignore: `.env`, `.venv`, `__pycache__`, `*.pyc`, `.cache`, `logs/`, `node_modules/`, `.next/`, `.DS_Store`
-
-Track: `.env.example`, `logs/.gitkeep`
+## Documentation and Maintainability
+- Keep code concise, readable, and production-oriented.
+- Prefer replaceable modules over tightly coupled implementations.
+- Write code so future agents can understand and modify it safely.
+- Any new feature must fit the existing modular structure rather than introducing shortcuts or duplication.
