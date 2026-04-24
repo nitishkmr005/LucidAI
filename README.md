@@ -2,7 +2,7 @@
 
 > Read aloud. Ask anything. Remember everything.
 
-A voice-powered AI reading companion: upload a document, have the agent read it aloud with live word highlighting, ask questions mid-reading, save annotated snippets, and export the annotated document as PDF or DOCX — all over a real-time WebRTC voice pipeline.
+A voice-powered AI reading companion built around a customer-facing voice UI: upload a document, have the agent read stored content aloud with live word highlighting, ask questions mid-reading, save annotated snippets, switch voices and speech speed, and export the annotated document as PDF or DOCX — all over a real-time WebRTC voice pipeline.
 
 ## Demo
 
@@ -13,10 +13,14 @@ Because text streaming and voice streaming are synchronized, TTS starts speaking
 
 ## Highlights
 
-- Upload `.md` documents and have the agent read them aloud with live word-level highlighting.
-- Ask questions mid-reading — agent answers directly or triggers a live web search.
+- Premium voice-first UI with an immersive orb, live transcript, voice settings, and full-screen reading mode.
+- Upload `.md` documents and have the agent read stored document text aloud with real-time word-level highlighting.
+- Reading mode expands the document workspace to full width for focused document playback and annotation.
+- The explicit document action starts reading from the beginning; resume remains available through saved session state.
+- Ask questions mid-reading — agent answers from recent document context first, or triggers a live web search when needed.
 - Save snippets (term + explanation) as persistent annotations on any sentence.
-- Manually highlight sentences; all highlights and snippets survive session restarts.
+- Manually highlight sentences; all highlights, snippets, and reading position survive session restarts.
+- Switch voices with preview playback and adjust speech speed from voice settings.
 - Export annotated documents as PDF (yellow-highlighted sentences, callout notes) or DOCX.
 - `WebRTC` is the default live transport, with `WebSocket` kept as a fallback/debug path.
 - Persistent multi-turn sessions keep conversation history in the same live voice call.
@@ -24,17 +28,32 @@ Because text streaming and voice streaming are synchronized, TTS starts speaking
 - Real-time barge-in stops playback when the user speaks over the assistant.
 - Dedicated streaming `Silero VAD` improves speech start/end detection, endpointing, and barge-in timing.
 
+## Product Experience
+
+NeuroTalk now has two primary workspace modes:
+
+- `Conversation`: the immersive orb is the main interaction, with the live transcript below and document context alongside it.
+- `Reading`: the selected document expands into a full-screen reading workspace with live reading state and synced highlighting.
+
+The top bar keeps the core controls always available:
+
+- workspace toggle: `Conversation` / `Reading`
+- live session state
+- private session marker
+- voice settings with preview playback and speech speed
+- dark/light theme toggle
+
 ## Stack
 
 | Layer | Tech |
 |-------|------|
-| Frontend | Next.js 15 · TypeScript · Lora + DM Serif Display fonts |
+| Frontend | Next.js 15 · TypeScript · immersive voice UI · dark/light themes |
 | Backend | FastAPI · Python 3.11+ · uv |
 | Transport (audio in) | **WebRTC / RTP** (Opus codec, `aiortc` + `PyAV`) · WebSocket PCM streaming |
 | Transport (agent out) | **RTCDataChannel** (ordered JSON) · WebSocket JSON |
 | STT | faster-whisper (`small`, int8, CPU) — via CTranslate2 |
 | LLM | Ollama (local) — `llama3.2:3b` (default) |
-| TTS | Kokoro 82M MLX (default) · Chatterbox Turbo · Qwen · VibeVoice |
+| TTS | Kokoro 82M MLX (default) · Chatterbox Turbo · Qwen · VibeVoice · voice preview · speech speed control |
 | Documents | Markdown upload · sentence-level annotation · JSON persistence |
 | Web search | DuckDuckGo (async, 5 s timeout) |
 | Export | reportlab (PDF) · python-docx (DOCX) |
@@ -76,6 +95,15 @@ NeuroTalk uses WebRTC as the customer-facing live voice transport:
 WebRTC is recommended because browser-native echo cancellation, noise suppression, and auto-gain control are applied before encoding. WebSocket remains in the codebase as an internal fallback/debug path, but the UI presents WebRTC only.
 
 The WebRTC path keeps a long-lived peer connection open so follow-up turns reuse the same session instead of reconnecting every request.
+
+## Reading Semantics
+
+The reading flow intentionally separates explicit UI actions from conversational resume behavior:
+
+- `Read aloud` from the document workspace starts the selected document from the beginning.
+- conversational commands such as `continue`, `resume`, or `keep reading` continue from the saved reading position.
+- during playback, the backend streams stored document sentences in order and emits word ticks so the UI can highlight the current spoken word.
+- interruptions preserve reading state, which allows Q&A without losing the document position.
 
 ## Environment Variables
 
@@ -205,7 +233,7 @@ docent/
 │   │   ├── webrtc/       # WebRTC transport (NEW)
 │   │   │   ├── router.py     # POST /webrtc/offer, DELETE /webrtc/session/{id}
 │   │   │   └── session.py    # RTCPeerConnection, RTP consumer, VAD, STT→LLM→TTS
-│   │   ├── services/     # STT, LLM, TTS, VAD service modules
+│   │   ├── services/     # STT, LLM, TTS, VAD, document store modules
 │   │   ├── prompts/      # System prompts
 │   │   ├── utils/        # Shared utilities (emotion tag cleaning, etc.)
 │   │   └── models.py     # Pydantic response models
@@ -213,8 +241,12 @@ docent/
 │   └── logs/             # JSON log files (latest 5 kept)
 ├── frontend/             # Next.js app
 │   └── components/
-│       ├── voice-agent-console.tsx   # Main UI — WebRTC + WS mode toggle
-│       └── webrtc-transport.ts       # RTCPeerConnection + RTCDataChannel client (NEW)
+│       ├── voice-agent-console.tsx   # Main customer-facing shell
+│       ├── document-panel.tsx        # Document workspace + reading view
+│       ├── voice/
+│       │   ├── VoiceOrbHero.tsx      # Immersive voice orb
+│       │   └── waveform-utils.ts     # Orb waveform helpers
+│       └── webrtc-transport.ts       # RTCPeerConnection + RTCDataChannel client
 ├── scripts/              # Standalone learnable Python demos
 │   ├── stt.py            # STT only
 │   ├── llm_call.py       # LLM only
@@ -254,3 +286,15 @@ uv run --project backend python scripts/agent.py path/to/audio.wav
 | `make check` | Lint + type check |
 | `make tts-envs` | Install isolated venvs for all TTS models |
 | `make tts-report` | Run all TTS models and save comparison report to `scripts/speech/` |
+
+## Recent UI Additions
+
+- Immersive voice orb with animated radial waveform and mini-wave status bars
+- Voice settings modal with:
+  - voice carousel
+  - preview playback
+  - speech speed control
+  - playback summary
+- Full-screen reading workspace
+- Better transcript and library empty states
+- Persistent dark/light theme selection

@@ -246,6 +246,23 @@ class WebRTCSession:
                 logger.info("session_id={} event=pause_reading_button", self.session_id)
 
         elif event_type == "continue_reading":
+            # If session is fresh (e.g. new WebRTC connection after pause), restore doc state
+            fallback_doc_id = str(payload.get("doc_id", ""))
+            if not self._active_document_id and fallback_doc_id:
+                doc = get_document_store().get_document(fallback_doc_id)
+                if doc:
+                    self._active_document_id = fallback_doc_id
+                    annotations = get_document_store().load_annotations(fallback_doc_id)
+                    if rp := annotations.get("reading_position"):
+                        saved_idx = rp.get("last_sentence_idx")
+                        if isinstance(saved_idx, int) and saved_idx >= 0:
+                            self._resume_from_sentence_idx = saved_idx
+                            self._last_read_sentence_idx = max(-1, saved_idx - 1)
+                    logger.info(
+                        "session_id={} event=continue_reading_restored doc_id={} resume_idx={}",
+                        self.session_id, fallback_doc_id, self._resume_from_sentence_idx,
+                    )
+
             if self._active_document_id and (self._llm_task is None or self._llm_task.done()):
                 doc = get_document_store().get_document(self._active_document_id)
                 if doc:
@@ -740,6 +757,7 @@ class WebRTCSession:
         start_idx: int,
         llm_ms: float,
     ) -> str:
+        self._interrupt_event.clear()
         doc = get_document_store().get_document(doc_id)
         if not doc:
             await self._play_tts_turn(
@@ -989,17 +1007,25 @@ class WebRTCSession:
                     results = await web_search(query, max_results=self._settings.web_search_max_results)
                     await self._send_json({"type": "doc_search_result", "query": query, "results": results})
                     if results:
-                        top = ". ".join(r.get("snippet", "") for r in results[:3] if r.get("snippet"))
-                        response_text = top or "Here is what I found online."
+                        # Spoken text — answer only, no URLs
+                        snippets = [r.get("snippet", "") for r in results[:3] if r.get("snippet")]
+                        spoken_text = ". ".join(snippets) if snippets else "Here is what I found online."
+                        # Display text — answer + source citations (shown in chat, not read aloud)
+                        source_lines = "\n".join(
+                            f"• {r['title']} — {r['url']}"
+                            for r in results[:3] if r.get("url") and r.get("title")
+                        )
+                        display_text = spoken_text + (f"\n\nSources:\n{source_lines}" if source_lines else "")
                     else:
-                        response_text = "I searched but could not find relevant results."
+                        spoken_text = "I searched but could not find relevant results."
+                        display_text = spoken_text
                     await self._play_tts_turn(
                         user_text=text,
-                        display_text=response_text,
-                        utterances=self._split_text_for_tts(response_text),
+                        display_text=display_text,
+                        utterances=self._split_text_for_tts(spoken_text),
                         llm_ms=llm_ms,
                     )
-                    display_response = response_text
+                    display_response = display_text
                 else:
                     response_text = decision.response_text or "I'm not sure how to help with that yet."
                     await self._play_tts_turn(

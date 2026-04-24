@@ -58,6 +58,7 @@ type DocumentPanelProps = {
   onReadSelectedDocument?: () => void;
   onResumeReading?: () => void;
   onPauseReading?: () => void;
+  onOpenSettings?: () => void;
 };
 
 function renderInlineMarkdown(text: string, keyPrefix: string): ReactNode[] {
@@ -206,42 +207,44 @@ function renderMarkdownDocument(rawMarkdown: string, options: MarkdownRendererOp
   let codeFence: { language: string; lines: string[] } | null = null;
 
   const renderSpeakableText = (text: string, keyPrefix: string): ReactNode[] => {
-    const normalizedBlock = normalizeForSentenceMatch(text);
-    const matchedSegments: { sentenceIdx: number; text: string }[] = [];
-    let matchCursor = 0;
-    let probe = sentenceCursor;
-
-    while (probe < sentenceTexts.length) {
-      const candidate = sentenceTexts[probe];
-      const normalizedCandidate = normalizeForSentenceMatch(candidate);
-      if (!normalizedCandidate) {
-        probe += 1;
-        continue;
-      }
-      const foundAt = normalizedBlock.indexOf(normalizedCandidate, matchCursor);
-      if (foundAt === -1) {
-        break;
-      }
-      matchedSegments.push({ sentenceIdx: probe, text: candidate });
-      matchCursor = foundAt + normalizedCandidate.length;
-      probe += 1;
-    }
-
-    const segments = matchedSegments.length
-      ? matchedSegments
-      : splitSpeakableSegments(text).map((segment, index) => ({
-          sentenceIdx: sentenceCursor + index,
-          text: segment,
-        }));
-
-    if (!segments.length) {
+    const splitSegments = splitSpeakableSegments(text);
+    if (!splitSegments.length) {
       return renderInlineMarkdown(text, keyPrefix);
     }
 
-    sentenceCursor += matchedSegments.length || segments.length;
+    const mappedSegments: { sentenceIdx: number | null; text: string }[] = [];
+    let probe = sentenceCursor;
 
-    return segments.map((segment, index) => {
-      const sentenceIdx = segment.sentenceIdx < sentenceTexts.length ? segment.sentenceIdx : null;
+    for (const segment of splitSegments) {
+      const normalizedSegment = normalizeForSentenceMatch(segment);
+      let matchedSentenceIdx: number | null = null;
+
+      for (let lookahead = probe; lookahead < Math.min(sentenceTexts.length, probe + 8); lookahead += 1) {
+        const candidate = sentenceTexts[lookahead];
+        const normalizedCandidate = normalizeForSentenceMatch(candidate);
+        if (!normalizedCandidate) {
+          continue;
+        }
+        if (
+          normalizedCandidate === normalizedSegment
+          || normalizedCandidate.includes(normalizedSegment)
+          || normalizedSegment.includes(normalizedCandidate)
+        ) {
+          matchedSentenceIdx = lookahead;
+          probe = lookahead + 1;
+          break;
+        }
+      }
+
+      mappedSegments.push({ sentenceIdx: matchedSentenceIdx, text: segment });
+    }
+
+    sentenceCursor = probe > sentenceCursor ? probe : sentenceCursor + splitSegments.length;
+
+    return mappedSegments.map((segment, index) => {
+      const sentenceIdx = segment.sentenceIdx !== null && segment.sentenceIdx < sentenceTexts.length
+        ? segment.sentenceIdx
+        : null;
       const isActive = sentenceIdx !== null && sentenceIdx === activeSentenceIdx;
       const sentenceSnippets = sentenceIdx !== null ? snippetsBySentence.get(sentenceIdx) ?? [] : [];
       const highlightColor = sentenceIdx !== null ? highlightsBySentence.get(sentenceIdx) : undefined;
@@ -296,7 +299,7 @@ function renderMarkdownDocument(rawMarkdown: string, options: MarkdownRendererOp
               </span>
             ) : null}
           </span>
-          {index < segments.length - 1 ? " " : ""}
+          {index < mappedSegments.length - 1 ? " " : ""}
         </Fragment>
       );
     });
@@ -452,7 +455,7 @@ function renderMarkdownDocument(rawMarkdown: string, options: MarkdownRendererOp
   return nodes;
 }
 
-export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplanation, onSelectionChange, onReadSelectedDocument, onResumeReading, onPauseReading }: DocumentPanelProps) {
+export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplanation, onSelectionChange, onReadSelectedDocument, onResumeReading, onPauseReading, onOpenSettings }: DocumentPanelProps) {
   const [documents, setDocuments] = useState<DocumentMeta[]>([]);
   const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
@@ -468,6 +471,7 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
   const [searchQuery, setSearchQuery] = useState<string | null>(null);
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [isSearchLoading, setIsSearchLoading] = useState(false);
+  const [activeRailTab, setActiveRailTab] = useState<"library" | "notes" | "history">("library");
   const [isReading, setIsReading] = useState(false);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const sentenceRefs = useRef(new Map<number, HTMLElement | null>());
@@ -709,7 +713,9 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
             <h2 className="doc-panel-title">{docTitle || "Document library"}</h2>
           </div>
           <div className="doc-panel-status">
-            <span className="status-pill is-ghost">{documents.length.toLocaleString()} documents</span>
+            {!selectedDocId && (
+              <span className="status-pill is-ghost">{documents.length.toLocaleString()} documents</span>
+            )}
             {selectedDocId && isReading ? (
               <button
                 type="button"
@@ -807,7 +813,12 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
         </div>
       </div>
       <aside className="doc-rail" aria-label="Document tools">
-        <button type="button" className="doc-rail-item is-active" aria-label="Library">
+        <button
+          type="button"
+          className={`doc-rail-item${activeRailTab === "library" ? " is-active" : ""}`}
+          aria-label="Library"
+          onClick={() => setActiveRailTab("library")}
+        >
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <path d="M7 3h7l4 4v14H7z" />
             <path d="M14 3v5h5" />
@@ -815,14 +826,24 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
           </svg>
           <span>Library</span>
         </button>
-        <button type="button" className="doc-rail-item" aria-label="Notes">
+        <button
+          type="button"
+          className={`doc-rail-item${activeRailTab === "notes" ? " is-active" : ""}`}
+          aria-label="Notes"
+          onClick={() => setActiveRailTab("notes")}
+        >
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <path d="M5 4h14v16H5z" />
             <path d="M8 8h8M8 12h8M8 16h5" />
           </svg>
           <span>Notes</span>
         </button>
-        <button type="button" className="doc-rail-item" aria-label="History">
+        <button
+          type="button"
+          className={`doc-rail-item${activeRailTab === "history" ? " is-active" : ""}`}
+          aria-label="History"
+          onClick={() => setActiveRailTab("history")}
+        >
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <path d="M12 8v5l3 2" />
             <path d="M4 12a8 8 0 1 0 2.35-5.65L4 8" />
@@ -830,7 +851,12 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
           </svg>
           <span>History</span>
         </button>
-        <button type="button" className="doc-rail-item" aria-label="Settings">
+        <button
+          type="button"
+          className="doc-rail-item"
+          aria-label="Voice settings"
+          onClick={onOpenSettings}
+        >
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <path d="M12 15.5A3.5 3.5 0 1 0 12 8a3.5 3.5 0 0 0 0 7.5z" />
             <path d="M19.4 15a1.8 1.8 0 0 0 .36 1.98l.04.04a2 2 0 1 1-2.83 2.83l-.04-.04A1.8 1.8 0 0 0 15 19.4a1.8 1.8 0 0 0-1 .6 1.8 1.8 0 0 0-.5 1.27V21a2 2 0 1 1-4 0v-.06A1.8 1.8 0 0 0 8 19.4a1.8 1.8 0 0 0-1.98.36l-.04.04a2 2 0 1 1-2.83-2.83l.04-.04A1.8 1.8 0 0 0 4.6 15a1.8 1.8 0 0 0-.6-1 1.8 1.8 0 0 0-1.27-.5H2.7a2 2 0 1 1 0-4h.06A1.8 1.8 0 0 0 4.6 8a1.8 1.8 0 0 0-.36-1.98l-.04-.04a2 2 0 1 1 2.83-2.83l.04.04A1.8 1.8 0 0 0 9 4.6a1.8 1.8 0 0 0 1-.6A1.8 1.8 0 0 0 10.5 2.73V2.7a2 2 0 1 1 4 0v.06A1.8 1.8 0 0 0 15 4.6a1.8 1.8 0 0 0 1.98-.36l.04-.04a2 2 0 1 1 2.83 2.83l-.04.04A1.8 1.8 0 0 0 19.4 9c.3.33.6.66 1 .6h.06a2 2 0 1 1 0 4h-.06a1.8 1.8 0 0 0-1 .6z" />

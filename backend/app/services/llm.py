@@ -54,7 +54,7 @@ async def _stream_openai(
         model=settings.openai_model,
         messages=messages,  # type: ignore[arg-type]
         stream=True,
-        max_tokens=settings.llm_max_tokens,
+        max_completion_tokens=settings.llm_max_tokens,
     )
     async for chunk in stream:
         token = chunk.choices[0].delta.content
@@ -70,7 +70,7 @@ async def _complete_openai(messages: list[dict[str, str]]) -> str:
         model=settings.openai_model,
         messages=messages,  # type: ignore[arg-type]
         stream=False,
-        max_tokens=settings.llm_max_tokens,
+        max_completion_tokens=settings.llm_max_tokens,
     )
     return response.choices[0].message.content or ""
 

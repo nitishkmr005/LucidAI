@@ -425,6 +425,7 @@ async def transcribe_stream(websocket: WebSocket) -> None:
         llm_ms: float,
     ) -> str:
         nonlocal active_document_id, resume_from_sentence_idx
+        interrupt_event.clear()
         doc = get_document_store().get_document(doc_id)
         if not doc:
             await _play_tts_turn(
@@ -900,6 +901,22 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                     if llm_task is not None and not llm_task.done():
                         llm_task.cancel()
                         llm_task = None
+                    continue
+
+                if event_type == "pause_reading":
+                    logger.info("request_id={} event=pause_reading_button", request_id)
+                    interrupt_event.set()
+                    pending_llm_call = None
+                    if silence_debounce_task is not None and not silence_debounce_task.done():
+                        silence_debounce_task.cancel()
+                        silence_debounce_task = None
+                    if active_tts_task is not None and not active_tts_task.done():
+                        active_tts_task.cancel()
+                        active_tts_task = None
+                    if llm_task is not None and not llm_task.done():
+                        llm_task.cancel()
+                        llm_task = None
+                    await send_json({"type": "doc_reading_pause"})
                     continue
 
                 if event_type == "stop":

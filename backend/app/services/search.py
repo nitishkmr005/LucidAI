@@ -13,7 +13,7 @@ async def web_search(query: str, max_results: int = 3) -> list[dict]:
     Returns an empty list on any failure (timeout, rate limit, no network).
     """
     def _sync_search() -> list[dict]:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=max_results))
         return [

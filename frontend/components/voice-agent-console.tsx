@@ -16,6 +16,21 @@ import { useDocumentHighlight } from "../hooks/use-document-highlight";
 import type { DocumentEvent } from "./document-panel";
 import { VoiceOrbHero, type VoiceState } from "./voice/VoiceOrbHero";
 
+const URL_REGEX = /(https?:\/\/[^\s,)]+)/g;
+
+function renderMessageText(text: string) {
+  const parts = text.split(URL_REGEX);
+  return parts.map((part, i) =>
+    /^https?:\/\//.test(part) ? (
+      <a key={i} href={part} target="_blank" rel="noopener noreferrer" className="chat-link">
+        {part}
+      </a>
+    ) : (
+      part
+    ),
+  );
+}
+
 type Mode = "listening" | "thinking" | "responding" | "speaking";
 
 type ChatMessage = {
@@ -238,6 +253,9 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
   // Audio queue: sentences arrive one at a time; we play them sequentially.
   type TtsChunk = { buffer: AudioBuffer; text: string; docSentenceIdx?: number };
   const ttsQueueRef = useRef<TtsChunk[]>([]);
+  const decodedTtsChunksRef = useRef<Map<number, TtsChunk>>(new Map());
+  const nextTtsChunkOrderRef = useRef(0);
+  const nextTtsChunkToQueueRef = useRef(0);
   const isTtsPlayingRef = useRef(false);
   const ttsAllChunksReceivedRef = useRef(false);
   // Text revealed so far in the current assistant turn (accumulates across chunks).
@@ -392,6 +410,9 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
     ttsSourceRef.current?.stop();
     ttsSourceRef.current = null;
     ttsQueueRef.current = [];
+    decodedTtsChunksRef.current.clear();
+    nextTtsChunkOrderRef.current = 0;
+    nextTtsChunkToQueueRef.current = 0;
     isTtsPlayingRef.current = false;
     ttsAllChunksReceivedRef.current = false;
     revealedTextRef.current = "";
@@ -483,6 +504,23 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
       }
     });
   }, [updateMsg, startWordHighlight]);
+
+  const queueDecodedTtsChunk = useCallback((order: number, chunk: TtsChunk) => {
+    decodedTtsChunksRef.current.set(order, chunk);
+
+    while (decodedTtsChunksRef.current.has(nextTtsChunkToQueueRef.current)) {
+      const nextChunk = decodedTtsChunksRef.current.get(nextTtsChunkToQueueRef.current);
+      decodedTtsChunksRef.current.delete(nextTtsChunkToQueueRef.current);
+      nextTtsChunkToQueueRef.current += 1;
+      if (nextChunk) {
+        ttsQueueRef.current.push(nextChunk);
+      }
+    }
+
+    if (!isTtsPlayingRef.current && ttsQueueRef.current.length > 0) {
+      playNextTtsChunk();
+    }
+  }, [playNextTtsChunk]);
 
   useEffect(() => {
     return () => {
@@ -727,6 +765,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
                 ? payload.sentence_idx
                 : pendingDocSentenceIdxRef.current ?? undefined;
             pendingDocSentenceIdxRef.current = null;
+            const chunkOrder = nextTtsChunkOrderRef.current++;
             const data = typeof payload.data === "string" ? payload.data : "";
             const binaryString = atob(data);
             const bytes = new Uint8Array(binaryString.length);
@@ -737,8 +776,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
             pendingDecodesRef.current++;
             void audioCtx.decodeAudioData(bytes.buffer.slice(0), (buffer) => {
               pendingDecodesRef.current--;
-              ttsQueueRef.current.push({ buffer, text: sentenceText, docSentenceIdx });
-              if (!isTtsPlayingRef.current) playNextTtsChunk();
+              queueDecodedTtsChunk(chunkOrder, { buffer, text: sentenceText, docSentenceIdx });
             });
             return;
           }
@@ -1163,6 +1201,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
               ? payload.sentence_idx
               : pendingDocSentenceIdxRef.current ?? undefined;
           pendingDocSentenceIdxRef.current = null;
+          const chunkOrder = nextTtsChunkOrderRef.current++;
           const binaryString = atob(payload.data ?? "");
           const bytes = new Uint8Array(binaryString.length);
           for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
@@ -1172,8 +1211,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
           pendingDecodesRef.current++;
           void audioCtx.decodeAudioData(bytes.buffer.slice(0), (buffer) => {
             pendingDecodesRef.current--;
-            ttsQueueRef.current.push({ buffer, text: sentenceText, docSentenceIdx });
-            if (!isTtsPlayingRef.current) playNextTtsChunk();
+            queueDecodedTtsChunk(chunkOrder, { buffer, text: sentenceText, docSentenceIdx });
           });
           return;
         }
@@ -1475,29 +1513,30 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
   }, [isConnecting, isFinalizing, selectedDocumentId, sendToBackend]);
 
   const requestDocumentResume = useCallback(() => {
-    if (!selectedDocumentId || isConnecting || isFinalizing) {
-      return;
-    }
+    if (!selectedDocumentId || isConnecting || isFinalizing) return;
     setWorkspaceView("reading");
-    const action = { type: "continue_reading" };
-    if (isRecordingRef.current) {
+    const action = { type: "continue_reading", doc_id: selectedDocumentId };
+    // Send directly if any active transport exists; otherwise start connection first
+    if (isRecordingRef.current || webrtcRef.current) {
       sendToBackend(action);
-      return;
+    } else {
+      pendingBackendActionRef.current = action;
+      void startStreamingRef.current();
     }
-    pendingBackendActionRef.current = action;
-    void startStreamingRef.current();
   }, [isConnecting, isFinalizing, selectedDocumentId, sendToBackend]);
 
-  const requestPauseReading = useCallback(() => {
+  const requestPauseReading = () => {
     if (isConnecting || isFinalizing) return;
-    const action = { type: "pause_reading" };
-    if (isRecordingRef.current) {
-      sendToBackend(action);
+    clearTtsQueue();
+    onDocumentEvent?.({ type: "doc_reading_pause" });
+    startTransition(() => { setMode("listening"); });
+    if (webrtcRef.current) {
+      sendToBackend({ type: "pause_reading" });
       return;
     }
-    pendingBackendActionRef.current = action;
-    void startStreamingRef.current();
-  }, [isConnecting, isFinalizing, sendToBackend]);
+    sendToBackend({ type: "pause_reading" });
+    sendToBackend({ type: "interrupt" });
+  };
 
   const stopStreaming = () => {
     startAttemptRef.current += 1;
@@ -1570,6 +1609,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
         onReadSelectedDocument: requestDocumentRead,
         onResumeReading: requestDocumentResume,
         onPauseReading: requestPauseReading,
+        onOpenSettings: openVoiceSettings,
         layoutMode: workspaceView === "reading" ? "reading" : "split",
       } as Record<string, unknown>)
     : children;
@@ -1998,7 +2038,13 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
                         {msg.isError ? (
                           <p className="chat-text chat-text--error">{msg.text}</p>
                         ) : msg.text ? (
-                          <p className="chat-text">{msg.text}</p>
+                          <div className="chat-text">
+                            {msg.text.split("\n").map((line, i) => (
+                              <p key={i} className={line === "" ? "chat-text-spacer" : undefined}>
+                                {renderMessageText(line)}
+                              </p>
+                            ))}
+                          </div>
                         ) : msg.isStreaming ? (
                           msg.role === "assistant" ? (
                             <div className="chat-typing-indicator" aria-label="AI is thinking">
