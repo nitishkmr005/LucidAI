@@ -268,6 +268,7 @@ class WebRTCSession:
                 if doc:
                     start_idx = self._get_read_start_idx(restart_from_beginning=False)
                     if start_idx < doc.sentence_count:
+                        await self._send_json({"type": "doc_reading_resume"})
                         self._llm_task = asyncio.ensure_future(
                             self._run_document_read(
                                 doc_id=doc.doc_id,

@@ -1515,6 +1515,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
   const requestDocumentResume = useCallback(() => {
     if (!selectedDocumentId || isConnecting || isFinalizing) return;
     setWorkspaceView("reading");
+    onDocumentEvent?.({ type: "doc_reading_resume" });
     const action = { type: "continue_reading", doc_id: selectedDocumentId };
     // Send directly if any active transport exists; otherwise start connection first
     if (isRecordingRef.current || webrtcRef.current) {
@@ -1523,7 +1524,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
       pendingBackendActionRef.current = action;
       void startStreamingRef.current();
     }
-  }, [isConnecting, isFinalizing, selectedDocumentId, sendToBackend]);
+  }, [isConnecting, isFinalizing, onDocumentEvent, selectedDocumentId, sendToBackend]);
 
   const requestPauseReading = () => {
     if (isConnecting || isFinalizing) return;

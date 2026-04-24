@@ -212,43 +212,17 @@ function renderMarkdownDocument(rawMarkdown: string, options: MarkdownRendererOp
       return renderInlineMarkdown(text, keyPrefix);
     }
 
-    const mappedSegments: { sentenceIdx: number | null; text: string }[] = [];
-    let probe = sentenceCursor;
+    const startSentenceIdx = sentenceCursor;
+    sentenceCursor += splitSegments.length;
 
-    for (const segment of splitSegments) {
-      const normalizedSegment = normalizeForSentenceMatch(segment);
-      let matchedSentenceIdx: number | null = null;
-
-      for (let lookahead = probe; lookahead < Math.min(sentenceTexts.length, probe + 8); lookahead += 1) {
-        const candidate = sentenceTexts[lookahead];
-        const normalizedCandidate = normalizeForSentenceMatch(candidate);
-        if (!normalizedCandidate) {
-          continue;
-        }
-        if (
-          normalizedCandidate === normalizedSegment
-          || normalizedCandidate.includes(normalizedSegment)
-          || normalizedSegment.includes(normalizedCandidate)
-        ) {
-          matchedSentenceIdx = lookahead;
-          probe = lookahead + 1;
-          break;
-        }
-      }
-
-      mappedSegments.push({ sentenceIdx: matchedSentenceIdx, text: segment });
-    }
-
-    sentenceCursor = probe > sentenceCursor ? probe : sentenceCursor + splitSegments.length;
-
-    return mappedSegments.map((segment, index) => {
-      const sentenceIdx = segment.sentenceIdx !== null && segment.sentenceIdx < sentenceTexts.length
-        ? segment.sentenceIdx
+    return splitSegments.map((segment, index) => {
+      const sentenceIdx = startSentenceIdx + index < sentenceTexts.length
+        ? startSentenceIdx + index
         : null;
       const isActive = sentenceIdx !== null && sentenceIdx === activeSentenceIdx;
       const sentenceSnippets = sentenceIdx !== null ? snippetsBySentence.get(sentenceIdx) ?? [] : [];
       const highlightColor = sentenceIdx !== null ? highlightsBySentence.get(sentenceIdx) : undefined;
-      const segmentWords = segment.text.split(/\s+/);
+      const segmentWords = segment.split(/\s+/);
       const key = `${keyPrefix}-segment-${index}`;
 
       return (
@@ -274,7 +248,7 @@ function renderMarkdownDocument(rawMarkdown: string, options: MarkdownRendererOp
                     {wordIndex < segmentWords.length - 1 ? " " : ""}
                   </span>
                 ))
-              : renderInlineMarkdown(segment.text, `${key}-inline`)}
+              : renderInlineMarkdown(segment, `${key}-inline`)}
             {sentenceSnippets.length ? (
               <span className="doc-note-anchor">
                 {sentenceSnippets.map((snippet) => (
@@ -299,7 +273,7 @@ function renderMarkdownDocument(rawMarkdown: string, options: MarkdownRendererOp
               </span>
             ) : null}
           </span>
-          {index < mappedSegments.length - 1 ? " " : ""}
+          {index < splitSegments.length - 1 ? " " : ""}
         </Fragment>
       );
     });

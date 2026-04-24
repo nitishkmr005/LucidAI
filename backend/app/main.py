@@ -845,11 +845,24 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                     continue
 
                 if event_type == "continue_reading":
+                    fallback_doc_id = str(payload.get("doc_id", ""))
+                    if not active_document_id and fallback_doc_id:
+                        doc = get_document_store().get_document(fallback_doc_id)
+                        if doc:
+                            active_document_id = fallback_doc_id
+                            annotations = get_document_store().load_annotations(fallback_doc_id)
+                            if rp := annotations.get("reading_position"):
+                                saved_idx = rp.get("last_sentence_idx")
+                                if isinstance(saved_idx, int) and saved_idx >= 0:
+                                    resume_from_sentence_idx = saved_idx
+                                    last_read_sentence_idx = max(-1, saved_idx - 1)
+
                     if active_document_id and (llm_task is None or llm_task.done()):
                         doc = get_document_store().get_document(active_document_id)
                         if doc:
                             start_idx = _get_read_start_idx(restart_from_beginning=False)
                             if start_idx < doc.sentence_count:
+                                await send_json({"type": "doc_reading_resume"})
                                 llm_task = asyncio.create_task(
                                     _run_document_read(
                                         doc_id=doc.doc_id,
