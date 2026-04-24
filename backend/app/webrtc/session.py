@@ -714,6 +714,7 @@ class WebRTCSession:
         display_text: str,
         utterances: list[tuple[str, int | None, str | None]],
         llm_ms: float,
+        enable_barge_in: bool = True,
     ) -> None:
         await self._send_json({"type": "llm_start", "user_text": user_text})
         await self._send_json({"type": "llm_partial", "text": display_text})
@@ -726,7 +727,7 @@ class WebRTCSession:
             await sent_queue.put(utterance)
         await sent_queue.put(None)
 
-        tts_task = asyncio.create_task(self._tts_sentence_pipeline(sent_queue))
+        tts_task = asyncio.create_task(self._tts_sentence_pipeline(sent_queue, enable_barge_in=enable_barge_in))
         self._tts_task = tts_task
         with suppress(asyncio.CancelledError):
             await tts_task
@@ -791,6 +792,7 @@ class WebRTCSession:
             display_text="",
             utterances=utterances,
             llm_ms=llm_ms,
+            enable_barge_in=False,
         )
         if not self._interrupt_event.is_set():
             self._resume_from_sentence_idx = None

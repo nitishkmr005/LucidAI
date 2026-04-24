@@ -299,7 +299,10 @@ async def transcribe_stream(websocket: WebSocket) -> None:
         ]
         return "\n\n".join(parts)
 
-    async def _tts_sentence_pipeline(queue: asyncio.Queue[tuple[str, int | None, str | None] | None]) -> None:
+    async def _tts_sentence_pipeline(
+        queue: asyncio.Queue[tuple[str, int | None, str | None] | None],
+        enable_barge_in: bool = True,
+    ) -> None:
         """
         Consume queued utterances from *queue* and synthesise + stream each one immediately.
 
@@ -381,6 +384,7 @@ async def transcribe_stream(websocket: WebSocket) -> None:
         display_text: str,
         utterances: list[tuple[str, int | None, str | None]],
         llm_ms: float,
+        enable_barge_in: bool = True,
     ) -> None:
         nonlocal active_tts_task
         await send_json({"type": "llm_start", "user_text": user_text})
@@ -394,7 +398,7 @@ async def transcribe_stream(websocket: WebSocket) -> None:
             await sent_queue.put(utterance)
         await sent_queue.put(None)
 
-        tts_task = asyncio.create_task(_tts_sentence_pipeline(sent_queue))
+        tts_task = asyncio.create_task(_tts_sentence_pipeline(sent_queue, enable_barge_in=enable_barge_in))
         active_tts_task = tts_task
         with suppress(asyncio.CancelledError):
             await tts_task
@@ -454,7 +458,13 @@ async def transcribe_stream(websocket: WebSocket) -> None:
             for idx in range(start_idx, len(doc.sentences))
             if clean_for_tts(doc.sentences[idx])
         ]
-        await _play_tts_turn(user_text=user_text, display_text="", utterances=utterances, llm_ms=llm_ms)
+        await _play_tts_turn(
+            user_text=user_text,
+            display_text="",
+            utterances=utterances,
+            llm_ms=llm_ms,
+            enable_barge_in=False,
+        )
         if not interrupt_event.is_set():
             resume_from_sentence_idx = None
         return f"Reading {doc.title} from sentence {start_idx}."
@@ -774,7 +784,7 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                 sent_queue.put_nowait((sentence, None, None))
         sent_queue.put_nowait(None)
 
-        await _tts_sentence_pipeline(sent_queue)
+        await _tts_sentence_pipeline(sent_queue, enable_barge_in=False)
 
     await send_json({"type": "ready", "request_id": request_id})
     asyncio.create_task(run_welcome())
