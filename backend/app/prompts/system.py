@@ -28,6 +28,23 @@ Return exactly one JSON object and nothing else — no markdown, no explanation,
   "highlight_color": string
 }
 
+=== FIELD NAMING — CRITICAL ===
+You MUST use these exact field names with underscores. Using any other casing or spelling will break the system:
+  "action"                 ← NOT "Action", NOT "ACTION"
+  "document_name"          ← NOT "documentname", NOT "documentName", NOT "document-name"
+  "response_text"          ← NOT "responsetext", NOT "responseText", NOT "response-text"
+  "restart_from_beginning" ← NOT "restartfrombeginning", NOT "restartFromBeginning"
+  "sentence_idx"           ← NOT "sentenceidx", NOT "sentenceIdx"
+  "note_text"              ← NOT "notetext", NOT "noteText"
+  "highlight_color"        ← NOT "highlightcolor", NOT "highlightColor"
+
+=== response_text FORMATTING — CRITICAL ===
+- "response_text" must contain plain spoken language only.
+- NEVER use double-quote characters ( " ) inside "response_text". Use single quotes or rephrase instead.
+  WRONG: "response_text": "He said \"hello\" to her."
+  RIGHT: "response_text": "He said 'hello' to her."
+- This prevents JSON parse errors that cause raw JSON to be displayed to the user.
+
 === CONTEXT YOU RECEIVE ===
 - A list of available documents with their titles
 - The currently selected document (if any) and its title

@@ -10,6 +10,11 @@ from app.services.document_store import ParsedDocument, get_document_store
 from config.settings import get_settings
 
 _JSON_OBJECT_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
+# Fallback: extract response_text from malformed JSON (e.g. unescaped quotes inside a value).
+_RESPONSE_TEXT_FALLBACK = re.compile(
+    r'"response_?text"\s*:\s*"(.*?)"(?=\s*[,}])',
+    re.DOTALL | re.IGNORECASE,
+)
 _NON_WORD_PATTERN = re.compile(r"[^a-z0-9]+")
 _STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "can", "continue", "did",
@@ -168,7 +173,11 @@ def parse_document_turn_response(raw: str) -> DocumentTurnDecision:
     try:
         payload = json.loads(match.group(0))
     except json.JSONDecodeError:
-        return DocumentTurnDecision(action="answer", response_text=text)
+        # JSON is malformed (e.g. unescaped quotes inside a string value).
+        # Try to salvage the response_text so the user sees the answer, not raw JSON.
+        rt_match = _RESPONSE_TEXT_FALLBACK.search(match.group(0))
+        extracted = rt_match.group(1).strip() if rt_match else ""
+        return DocumentTurnDecision(action="answer", response_text=extracted or text)
 
     action = str(payload.get("action", "answer")).strip().lower()
     if action not in {

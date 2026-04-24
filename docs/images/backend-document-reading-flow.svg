@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="980" viewBox="0 0 1200 980" role="img" aria-labelledby="title desc">
+  <title id="title">NeuroTalk backend document reading flow</title>
+  <desc id="desc">A static sequence diagram showing the document reading flow from UI command through document store, TTS, reading position persistence, highlighting, pause, and completion.</desc>
+  <defs>
+    <style>
+      .bg { fill: #0f172a; }
+      .lane { stroke: #334155; stroke-width: 2; }
+      .head-ui { fill: #0f766e; stroke: #5eead4; stroke-width: 2; rx: 12; }
+      .head-svc { fill: #1d4ed8; stroke: #93c5fd; stroke-width: 2; rx: 12; }
+      .head-store { fill: #7c3aed; stroke: #c4b5fd; stroke-width: 2; rx: 12; }
+      .text { fill: #e5e7eb; font-family: Arial, Helvetica, sans-serif; font-size: 20px; font-weight: 600; }
+      .small { fill: #cbd5e1; font-family: Arial, Helvetica, sans-serif; font-size: 19px; }
+      .msg { stroke: #93c5fd; stroke-width: 3; fill: none; marker-end: url(#arrowhead); }
+      .return { stroke: #fcd34d; stroke-width: 3; fill: none; marker-end: url(#arrowhead); stroke-dasharray: 8 7; }
+      .loop { fill: rgba(17,24,39,0.72); stroke: #475569; stroke-width: 2; rx: 12; }
+      .term { fill: #111827; stroke: #64748b; stroke-width: 2; rx: 12; }
+      .legend-text { fill: #cbd5e1; font-family: Arial, Helvetica, sans-serif; font-size: 15px; font-weight: 600; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#cbd5e1"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" width="1200" height="980"/>
+  <text x="50" y="58" class="text" style="font-size:32px;">Backend Document Reading Flow</text>
+  <text x="50" y="92" class="small">The session reads stored sentences in order, persists progress, and keeps pause/resume exact.</text>
+
+  <rect x="760" y="32" width="380" height="90" class="term"/>
+  <text x="950" y="60" class="legend-text" text-anchor="middle">Stored document sentences only</text>
+  <text x="950" y="86" class="legend-text" text-anchor="middle">LLM is not used for reading playback</text>
+  <text x="950" y="112" class="legend-text" text-anchor="middle">Pause preserves position for exact resume</text>
+
+  <rect x="40" y="130" width="170" height="56" class="head-ui"/>
+  <rect x="260" y="130" width="170" height="56" class="head-svc"/>
+  <rect x="480" y="130" width="180" height="56" class="head-store"/>
+  <rect x="720" y="130" width="140" height="56" class="head-svc"/>
+  <rect x="940" y="130" width="170" height="56" class="head-ui"/>
+
+  <text x="125" y="165" class="text" text-anchor="middle">Read / Resume UI</text>
+  <text x="345" y="165" class="text" text-anchor="middle">Session</text>
+  <text x="570" y="165" class="text" text-anchor="middle">Document Store</text>
+  <text x="790" y="165" class="text" text-anchor="middle">TTS</text>
+  <text x="1025" y="165" class="text" text-anchor="middle">Client UI</text>
+
+  <line x1="125" y1="205" x2="125" y2="870" class="lane"/>
+  <line x1="345" y1="205" x2="345" y2="870" class="lane"/>
+  <line x1="570" y1="205" x2="570" y2="870" class="lane"/>
+  <line x1="790" y1="205" x2="790" y2="870" class="lane"/>
+  <line x1="1025" y1="205" x2="1025" y2="870" class="lane"/>
+
+  <path d="M135 250 H335" class="msg"/>
+  <text x="235" y="238" class="small" text-anchor="middle">doc_read / continue_reading</text>
+
+  <path d="M355 320 H560" class="msg"/>
+  <text x="458" y="308" class="small" text-anchor="middle">load selected document</text>
+
+  <path d="M570 390 H355" class="return"/>
+  <text x="462" y="378" class="small" text-anchor="middle">sentences + saved position</text>
+
+  <path d="M355 460 H1015" class="msg"/>
+  <text x="685" y="448" class="small" text-anchor="middle">doc_read_start</text>
+
+  <rect x="280" y="500" width="800" height="220" class="loop"/>
+  <text x="305" y="530" class="small">Loop: sentence by sentence</text>
+
+  <path d="M355 570 H780" class="msg"/>
+  <text x="567" y="558" class="small" text-anchor="middle">synthesize stored sentence only</text>
+
+  <path d="M355 620 H560" class="msg"/>
+  <text x="458" y="608" class="small" text-anchor="middle">persist reading_position after spoken sentence</text>
+
+  <path d="M355 670 H1015" class="msg"/>
+  <text x="685" y="658" class="small" text-anchor="middle">doc_highlight(sentence_idx)</text>
+
+  <path d="M790 720 H355" class="return"/>
+  <text x="572" y="708" class="small" text-anchor="middle">wav bytes</text>
+
+  <path d="M355 770 H1015" class="msg"/>
+  <text x="685" y="758" class="small" text-anchor="middle">tts_audio(sentence_idx, sentence_text)</text>
+
+  <rect x="55" y="820" width="300" height="95" class="term"/>
+  <text x="205" y="846" class="small" text-anchor="middle">Pause path</text>
+  <text x="205" y="850" class="small" text-anchor="middle">UI sends pause_reading</text>
+  <text x="205" y="876" class="small" text-anchor="middle">Session emits doc_reading_pause</text>
+  <text x="205" y="902" class="small" text-anchor="middle">Resume continues from saved sentence index</text>
+
+  <rect x="845" y="820" width="290" height="95" class="term"/>
+  <text x="990" y="850" class="small" text-anchor="middle">Completion path</text>
+  <text x="990" y="876" class="small" text-anchor="middle">Sentence loop finishes</text>
+  <text x="990" y="902" class="small" text-anchor="middle">Session emits tts_done</text>
+</svg>

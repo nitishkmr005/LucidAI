@@ -105,6 +105,136 @@ The reading flow intentionally separates explicit UI actions from conversational
 - during playback, the backend streams stored document sentences in order and emits word ticks so the UI can highlight the current spoken word.
 - interruptions preserve reading state, which allows Q&A without losing the document position.
 
+## Backend Runtime Design
+
+This section is backend-only. It explains how the server moves audio, document state, and control events through the system.
+
+### Backend Repository Architecture
+
+![Backend repository architecture](docs/images/backend-repo-architecture.png)
+
+The backend flow is easier to read as a staged pipeline:
+
+1. The browser sends either microphone audio or a UI control action into the FastAPI entrypoint.
+2. The entrypoint routes the request into the active transport:
+   `WebRTC` by default, `WebSocket` as fallback/debug.
+3. Incoming audio passes through streaming VAD, then into the STT service.
+4. The turn orchestrator classifies the intent:
+   `Q&A`, `Read document`, `Resume/Pause`, or `Highlight/Note/Export`.
+5. Intent routing fans out to the right backend subsystem:
+   the `LLM service`, `Document store`, `Reading state machine`, or `Annotation + export services`.
+6. Anything that must be spoken goes through the `TTS service`.
+7. The backend emits typed events back to the client:
+   `tts_audio`, `tts_done`, `tts_interrupted`, `doc_read_start`, `doc_highlight`, `reading_position`, `doc_note_saved`, `doc_highlight_saved`, and `doc_export`.
+8. Those events are delivered over `RTCDataChannel` in the WebRTC path or JSON over `WebSocket` in fallback mode.
+
+### Backend Q&A Flow
+
+| Step | From | To | What moves |
+|------|------|----|------------|
+| 1 | User audio | Session | PCM / RTP frames |
+| 2 | Session | VAD | streaming audio frames |
+| 3 | VAD | Session | speech start / speech end markers |
+| 4 | Session | Whisper STT | buffered speech segment |
+| 5 | Whisper STT | Session | transcript |
+| 6 | Session | LLM | transcript + conversation history + recent document context |
+| 7 | LLM | Session | structured decision + response text |
+| 8 | Session | TTS | response text |
+| 9 | TTS | Session | sentence audio chunks |
+| 10 | Session | Client | `llm_start`, `llm_partial`, `llm_final` |
+| 11 | Session | Client | `tts_start`, `tts_audio`, `tts_done` |
+
+In short: audio becomes transcript, transcript becomes a grounded answer, and the answer is streamed back as both text events and audio events.
+
+### Backend Document Reading Flow
+
+| Step | From | To | What happens |
+|------|------|----|--------------|
+| 1 | UI | Session | `doc_read` or `continue_reading` |
+| 2 | Session | Document store | load selected document |
+| 3 | Document store | Session | ordered sentences + saved `reading_position` |
+| 4 | Session | Client UI | `doc_read_start` |
+| 5 | Session | TTS | synthesize the next stored sentence only |
+| 6 | Session | Document store | persist `reading_position(sentence_idx)` |
+| 7 | Session | Client UI | `doc_highlight(sentence_idx)` |
+| 8 | TTS | Session | wav bytes |
+| 9 | Session | Client UI | `tts_audio(sentence_idx, sentence_text)` |
+
+The loop above repeats sentence by sentence until one of these terminal states happens:
+
+| End condition | Backend result |
+|--------------|----------------|
+| User pauses | session emits `doc_reading_pause` and keeps the saved sentence index |
+| Reading completes | session emits `tts_done` |
+
+### Backend Control-State Model
+
+The backend keeps reading continuity through a small set of authoritative session variables:
+
+| State | Purpose |
+|------|---------|
+| `active_document_id` / `_active_document_id` | Current selected document for reading and Q&A |
+| `last_read_sentence_idx` / `_last_read_sentence_idx` | Most recently emitted sentence index |
+| `resume_from_sentence_idx` / `_resume_from_sentence_idx` | Resume cursor after pause/interruption |
+| `interrupt_event` / `_interrupt_event` | Immediate stop signal for active TTS / read flow |
+| `llm_task` / `_llm_task` | Running orchestration task |
+| `tts_task` / `_tts_task` | Running synthesis / streaming task |
+
+This is the core rule behind pause/resume:
+
+1. `pause_reading` stops active TTS immediately.
+2. The session keeps the saved sentence index.
+3. `continue_reading` restarts the document reader from that saved index.
+4. The backend emits the same sentence index back to the client in `tts_audio` and `doc_highlight`.
+
+### Backend Event Contract For Animation
+
+The frontend animation is not authoritative. It follows backend events. These are the events that drive the visible state:
+
+| Backend event | Meaning | Expected UI animation/state |
+|--------------|---------|-----------------------------|
+| `ready` | transport/session is usable | idle orb / ready controls |
+| `partial` | live STT still in progress | listening waveform |
+| `final` | user turn finalized | thinking transition |
+| `llm_start` | assistant turn opened | transcript assistant bubble appears |
+| `llm_partial` | assistant text is forming | responding state |
+| `tts_start` | playback started | speaking orb / waveform activation |
+| `tts_audio` | ordered sentence audio chunk | sentence reveal + word highlight scheduler |
+| `doc_read_start` | document reading session started | reading workspace enters active mode |
+| `doc_highlight` | backend advanced to a specific sentence | current sentence card/line updates |
+| `doc_reading_resume` | resume accepted by backend | reading state resumes without reset |
+| `doc_reading_pause` | pause accepted by backend | playback animation stops, state preserved |
+| `tts_interrupted` | playback was cut off | orb collapses back to listening |
+| `tts_done` | playback completed | speaking animation ends cleanly |
+
+### Animation Design Notes From The Backend Contract
+
+These are design rules implied by the backend event stream:
+
+- `tts_audio` order must be preserved. If chunk order changes, spoken text, transcript reveal, and word highlight drift apart.
+- `doc_highlight` and `tts_audio.sentence_idx` must refer to the same sentence sequence from the stored document, not a regenerated paraphrase.
+- `pause_reading` must never clear reading position; it only stops active synthesis.
+- `continue_reading` must clear the interrupt flag before restarting TTS.
+- document reading uses stored-content playback with barge-in disabled, otherwise ambient mic input can cancel reading mid-sentence.
+- the UI should animate only from backend truth, not from speculative client timers beyond per-chunk word highlighting.
+
+### Why The Reading Flow Is Stable
+
+The backend preserves correctness by separating responsibilities:
+
+- the document store owns ordered source sentences
+- the session owns current reading position
+- the LLM decides only Q&A and action routing
+- the TTS service speaks the exact stored sentence text
+- the client animates from backend sentence indices and audio chunk order
+
+That separation is what keeps:
+
+- resume exact
+- pause immediate
+- interruption reversible
+- and highlighting aligned to spoken stored text
+
 ## Environment Variables
 
 Copy `backend/.env.example` → `backend/.env` and adjust as needed.
