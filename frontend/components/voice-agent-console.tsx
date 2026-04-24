@@ -1498,25 +1498,29 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
     syncSelectedDocument(selectedDocumentId ?? null);
   }, [selectedDocumentId, syncSelectedDocument]);
 
-  const requestDocumentRead = useCallback(() => {
-    if (!selectedDocumentId || isConnecting || isFinalizing) {
+  const requestDocumentRead = useCallback((docId?: string | null) => {
+    const targetDocId = docId ?? selectedDocumentId ?? loadedDocumentIdRef.current;
+    if (!targetDocId || isConnecting || isFinalizing) {
       return;
     }
     setWorkspaceView("reading");
-    const action = { type: "doc_read", doc_id: selectedDocumentId, restart_from_beginning: true };
+    syncSelectedDocument(targetDocId);
+    const action = { type: "doc_read", doc_id: targetDocId, restart_from_beginning: true };
     if (isRecordingRef.current) {
       sendToBackend(action);
       return;
     }
     pendingBackendActionRef.current = action;
     void startStreamingRef.current();
-  }, [isConnecting, isFinalizing, selectedDocumentId, sendToBackend]);
+  }, [isConnecting, isFinalizing, selectedDocumentId, sendToBackend, syncSelectedDocument]);
 
-  const requestDocumentResume = useCallback(() => {
-    if (!selectedDocumentId || isConnecting || isFinalizing) return;
+  const requestDocumentResume = useCallback((docId?: string | null) => {
+    const targetDocId = docId ?? selectedDocumentId ?? loadedDocumentIdRef.current;
+    if (!targetDocId || isConnecting || isFinalizing) return;
     setWorkspaceView("reading");
     onDocumentEvent?.({ type: "doc_reading_resume" });
-    const action = { type: "continue_reading", doc_id: selectedDocumentId };
+    syncSelectedDocument(targetDocId);
+    const action = { type: "continue_reading", doc_id: targetDocId };
     // Send directly if any active transport exists; otherwise start connection first
     if (isRecordingRef.current || webrtcRef.current) {
       sendToBackend(action);
@@ -1524,7 +1528,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
       pendingBackendActionRef.current = action;
       void startStreamingRef.current();
     }
-  }, [isConnecting, isFinalizing, onDocumentEvent, selectedDocumentId, sendToBackend]);
+  }, [isConnecting, isFinalizing, onDocumentEvent, selectedDocumentId, sendToBackend, syncSelectedDocument]);
 
   const requestPauseReading = () => {
     if (isConnecting || isFinalizing) return;

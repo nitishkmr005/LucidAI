@@ -55,8 +55,8 @@ type DocumentPanelProps = {
   pendingSnippetTerm?: string | null;
   pendingSnippetExplanation?: string | null;
   onSelectionChange?: (docId: string | null) => void;
-  onReadSelectedDocument?: () => void;
-  onResumeReading?: () => void;
+  onReadSelectedDocument?: (docId?: string | null) => void;
+  onResumeReading?: (docId?: string | null) => void;
   onPauseReading?: () => void;
   onOpenSettings?: () => void;
 };
@@ -702,7 +702,7 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
               <button
                 type="button"
                 className="doc-read-button doc-read-button--resume"
-                onClick={onResumeReading}
+                onClick={() => onResumeReading?.(selectedDocId)}
               >
                 Resume
               </button>
@@ -710,7 +710,7 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
               <button
                 type="button"
                 className="doc-read-button"
-                onClick={onReadSelectedDocument}
+                onClick={() => onReadSelectedDocument?.(selectedDocId)}
               >
                 Read aloud
               </button>
@@ -719,7 +719,7 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
               <button
                 type="button"
                 className="doc-read-button doc-read-button--restart"
-                onClick={onReadSelectedDocument}
+                onClick={() => onReadSelectedDocument?.(selectedDocId)}
               >
                 Restart
               </button>

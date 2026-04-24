@@ -73,7 +73,7 @@ class Settings(BaseSettings):
 
     # OpenAI
     openai_api_key: str = ""
-    openai_model: str = "gpt-5.4-mini"
+    openai_model: str = "gpt-5.4"
 
     # Anthropic (future)
     anthropic_api_key: str = ""

@@ -185,17 +185,19 @@ def parse_document_turn_response(raw: str) -> DocumentTurnDecision:
     }:
         action = "answer"
 
-    document_name = payload.get("document_name")
+    document_name = payload.get("document_name", payload.get("documentname"))
     if document_name is not None:
         document_name = str(document_name).strip() or None
 
-    response_text = payload.get("response_text", "")
+    response_text = payload.get("response_text", payload.get("responsetext", ""))
     if response_text is None:
         response_text = ""
 
     restart_from_beginning = bool(
         payload.get("restart_from_beginning")
+        or payload.get("restartfrombeginning")
         or payload.get("start_from_beginning")
+        or payload.get("startfrombeginning")
         or payload.get("restart")
     )
     sentence_idx = payload.get("sentence_idx")
