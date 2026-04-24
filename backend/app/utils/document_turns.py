@@ -5,6 +5,8 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+
 from app.prompts.system import DOCUMENT_TURN_PROMPT
 from app.services.document_store import ParsedDocument, get_document_store
 from config.settings import get_settings
@@ -50,6 +52,35 @@ class DocumentTurnDecision:
     sentence_idx: int | None = None
     note_text: str = ""
     highlight_color: str = "yellow"
+
+
+_VALID_ACTIONS: frozenset[str] = frozenset({
+    "answer", "read_document", "continue_reading", "pause_reading",
+    "ask_document_clarification", "list_documents", "save_note",
+    "highlight_sentence", "web_search", "open_document",
+})
+
+
+class _LLMDecisionSchema(BaseModel):
+    """Pydantic model used only to validate the raw JSON dict from the LLM."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    action: str = "answer"
+    document_name: str | None = None
+    response_text: str = ""
+    restart_from_beginning: bool = False
+    sentence_idx: int | None = None
+    note_text: str = ""
+    highlight_color: str = "yellow"
+
+    @field_validator("action")
+    @classmethod
+    def _validate_action(cls, v: str) -> str:
+        normalised = v.strip().lower()
+        if normalised not in _VALID_ACTIONS:
+            raise ValueError(f"unknown action {v!r}")
+        return normalised
 
 
 def detect_direct_read_intent(user_text: str) -> DocumentTurnDecision | None:
@@ -165,67 +196,63 @@ def build_document_turn_context(
 
 
 def parse_document_turn_response(raw: str) -> DocumentTurnDecision:
+    """Parse and Pydantic-validate the LLM JSON response into a DocumentTurnDecision.
+
+    Args:
+        raw: Raw LLM output string expected to contain a JSON object.
+
+    Returns:
+        Validated DocumentTurnDecision.
+
+    Raises:
+        ValueError: If no JSON object is found, the JSON is malformed, or
+            Pydantic schema validation fails (e.g. unknown action).
+    """
     text = raw.strip()
     match = _JSON_OBJECT_PATTERN.search(text)
     if not match:
-        return DocumentTurnDecision(action="answer", response_text=text)
+        raise ValueError("no JSON object found in LLM response")
 
     try:
         payload = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        # JSON is malformed (e.g. unescaped quotes inside a string value).
-        # Try to salvage the response_text so the user sees the answer, not raw JSON.
-        rt_match = _RESPONSE_TEXT_FALLBACK.search(match.group(0))
-        extracted = rt_match.group(1).strip() if rt_match else ""
-        return DocumentTurnDecision(action="answer", response_text=extracted or text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"malformed JSON from LLM: {exc}") from exc
 
-    action = str(payload.get("action", "answer")).strip().lower()
-    if action not in {
-        "answer",
-        "read_document",
-        "continue_reading",
-        "pause_reading",
-        "ask_document_clarification",
-        "list_documents",
-        "save_note",
-        "highlight_sentence",
-        "web_search",
-        "open_document",
-    }:
-        action = "answer"
+    # Normalise aliased field names before Pydantic validation.
+    normalised: dict[str, object] = {
+        "action": payload.get("action", "answer"),
+        "document_name": payload.get("document_name") or payload.get("documentname"),
+        "response_text": str(payload.get("response_text") or payload.get("responsetext") or ""),
+        "restart_from_beginning": bool(
+            payload.get("restart_from_beginning")
+            or payload.get("restartfrombeginning")
+            or payload.get("start_from_beginning")
+            or payload.get("startfrombeginning")
+            or payload.get("restart")
+        ),
+        "sentence_idx": payload.get("sentence_idx"),
+        "note_text": str(payload.get("note_text") or payload.get("note") or ""),
+        "highlight_color": str(payload.get("highlight_color") or payload.get("color") or "yellow"),
+    }
 
-    document_name = payload.get("document_name", payload.get("documentname"))
-    if document_name is not None:
-        document_name = str(document_name).strip() or None
-
-    response_text = payload.get("response_text", payload.get("responsetext", ""))
-    if response_text is None:
-        response_text = ""
-
-    restart_from_beginning = bool(
-        payload.get("restart_from_beginning")
-        or payload.get("restartfrombeginning")
-        or payload.get("start_from_beginning")
-        or payload.get("startfrombeginning")
-        or payload.get("restart")
-    )
-    sentence_idx = payload.get("sentence_idx")
     try:
-        parsed_sentence_idx = int(sentence_idx) if sentence_idx is not None else None
-    except (TypeError, ValueError):
-        parsed_sentence_idx = None
+        schema = _LLMDecisionSchema.model_validate(normalised)
+    except ValidationError as exc:
+        raise ValueError(f"LLM JSON failed schema validation: {exc}") from exc
 
-    note_text = payload.get("note_text") or payload.get("note") or ""
-    highlight_color = str(payload.get("highlight_color") or payload.get("color") or "yellow").strip() or "yellow"
+    try:
+        sentence_idx = int(schema.sentence_idx) if schema.sentence_idx is not None else None
+    except (TypeError, ValueError):
+        sentence_idx = None
 
     return DocumentTurnDecision(
-        action=action,
-        document_name=document_name,
-        response_text=str(response_text).strip(),
-        restart_from_beginning=restart_from_beginning,
-        sentence_idx=parsed_sentence_idx,
-        note_text=str(note_text).strip(),
-        highlight_color=highlight_color,
+        action=schema.action,  # type: ignore[arg-type]
+        document_name=schema.document_name.strip() if schema.document_name else None,
+        response_text=schema.response_text.strip(),
+        restart_from_beginning=schema.restart_from_beginning,
+        sentence_idx=sentence_idx,
+        note_text=schema.note_text.strip(),
+        highlight_color=schema.highlight_color.strip() or "yellow",
     )
 
 

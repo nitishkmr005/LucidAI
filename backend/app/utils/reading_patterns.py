@@ -26,3 +26,24 @@ READ_FROM_BEGINNING_PATTERN = re.compile(
     r"|\bstart over\b|\brestart\b",
     re.IGNORECASE,
 )
+
+# Matches requests to highlight the sentence currently being read (vague "this" reference).
+_CURRENT_SENTENCE_HIGHLIGHT_PATTERN = re.compile(
+    r"\b(highlight|mark|emphasize)\b.{0,40}\b(this|that|current|the sentence (you('re| are)|were|just)|what you (just |were )?read)\b"
+    r"|\b(highlight|mark)\s+(this|that)\b",
+    re.IGNORECASE,
+)
+
+
+def refers_to_current_sentence(text: str) -> bool:
+    """Return True when the user's highlight request refers to the actively-read sentence.
+
+    Args:
+        text: Raw user utterance.
+
+    Returns:
+        True if the utterance is a vague "highlight this" / "highlight what you just read"
+        reference that should resolve to the last-read sentence index rather than a
+        content-matched sentence chosen by the LLM.
+    """
+    return bool(_CURRENT_SENTENCE_HIGHLIGHT_PATTERN.search(text))

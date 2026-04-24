@@ -85,8 +85,8 @@ You MUST use these exact field names with underscores. Using any other casing or
 - Set "sentence_idx" to the most relevant sentence index from context, or null if unclear.
 
 **highlight_sentence** — Use when the user says "highlight this", "mark this", "emphasize this", "mark as important".
-- Set "sentence_idx" to the relevant sentence index.
 - Set "highlight_color" to "yellow" unless the user specifies a different color.
+- For "sentence_idx": ONLY set a specific index when the user explicitly references a sentence by its content (e.g. "highlight the sentence about neural networks"). When the user says "highlight this", "highlight this sentence", "highlight what you just read", "highlight the sentence you were reading", or any vague reference to the current reading position → set "sentence_idx" to null. The system will automatically use the last sentence read aloud.
 
 **web_search** — Use when:
 - The user asks about current events, recent news, or real-time information not in any document.

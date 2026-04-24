@@ -34,6 +34,7 @@ from app.utils.reading_patterns import (
     CONTINUE_READING_PATTERN,
     PAUSE_PATTERN,
     READ_FROM_BEGINNING_PATTERN,
+    refers_to_current_sentence as _refers_to_current_sentence,
 )
 from config.settings import get_settings
 
@@ -170,7 +171,12 @@ class AgentPipeline:
             self._llm_task = None
 
     def schedule_llm(self, text: str, trigger: str) -> None:
-        """Schedule an LLM call, cancelling any stale in-flight call first."""
+        """Schedule an LLM call, cancelling any stale in-flight call first.
+
+        Args:
+            text: Normalised user utterance to process.
+            trigger: Label used in session log (e.g. ``"final"``).
+        """
         normalized = text.strip()
         if len(normalized) < self._settings.stream_llm_min_chars:
             return
@@ -202,7 +208,14 @@ class AgentPipeline:
         user_text: str = "",
         llm_ms: float = 0.0,
     ) -> None:
-        """Start a document read as the active LLM task."""
+        """Start a document read as the active LLM task.
+
+        Args:
+            doc_id: Document ID to read from the store.
+            start_idx: Sentence index to begin reading from.
+            user_text: Originating user utterance echoed in LLM events.
+            llm_ms: LLM latency to forward to the read pipeline.
+        """
         self._llm_task = asyncio.ensure_future(
             self._run_document_read(
                 doc_id=doc_id, user_text=user_text, start_idx=start_idx, llm_ms=llm_ms
@@ -210,6 +223,14 @@ class AgentPipeline:
         )
 
     def get_read_start_idx(self, *, restart_from_beginning: bool) -> int:
+        """Compute the sentence index to start the next document read.
+
+        Args:
+            restart_from_beginning: When True, returns 0 regardless of saved position.
+
+        Returns:
+            Index of the first sentence to read next.
+        """
         if restart_from_beginning:
             return 0
         if self._resume_from_sentence_idx is not None:
@@ -219,6 +240,10 @@ class AgentPipeline:
         return 0
 
     async def run_welcome(self) -> None:
+        """Synthesise and stream the configured welcome message on session start.
+
+        Barge-in is disabled for the welcome utterance.
+        """
         welcome = self._settings.welcome_message
         if not welcome:
             return
@@ -237,12 +262,29 @@ class AgentPipeline:
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _resolve_tts_voice(self, voice: str | None) -> str:
+        """Return a validated TTS voice ID, falling back to the default if invalid.
+
+        Args:
+            voice: Requested voice ID to validate against the available list.
+
+        Returns:
+            A voice ID that exists in the available voices list.
+        """
         valid_voices = {item["id"] for item in get_available_tts_voices()}
         if voice and voice in valid_voices:
             return voice
         return get_default_tts_voice()
 
     def _split_text_for_tts(self, text: str) -> list[tuple[str, int | None, str | None]]:
+        """Split plain text into TTS utterance tuples at sentence boundaries.
+
+        Args:
+            text: Raw text to split.
+
+        Returns:
+            List of ``(sentence, sentence_idx, display_text)`` tuples where
+            ``sentence_idx`` and ``display_text`` are both ``None`` for Q&A turns.
+        """
         utterances: list[tuple[str, int | None, str | None]] = []
         for raw in re.split(r"(?<=[.!?])\s+", text.strip()):
             sentence = clean_for_tts(raw.strip())
@@ -251,6 +293,17 @@ class AgentPipeline:
         return utterances
 
     def _build_prompt_dump(self, user_text: str, document_context: str | None) -> str:
+        """Serialise the full LLM prompt for session logging.
+
+        Args:
+            user_text: The user's current utterance.
+            document_context: Surrounding document sentences, or ``None`` when no
+                document is active.
+
+        Returns:
+            Human-readable string combining system prompt, document context,
+            conversation history, and the current user turn.
+        """
         history = "\n".join(
             f"{entry['role']}: {entry['content']}" for entry in self._conversation_history
         )
@@ -269,6 +322,18 @@ class AgentPipeline:
         queue: asyncio.Queue[tuple[str, int | None, str | None] | None],
         enable_barge_in: bool = True,
     ) -> None:
+        """Consume sentences from *queue* and stream TTS audio to the client.
+
+        Runs until a ``None`` sentinel is received or the interrupt event is set.
+        Emits ``tts_start``, ``tts_audio``, and ``tts_done`` / ``tts_interrupted``
+        JSON events; updates ``_last_read_sentence_idx`` for document reads.
+
+        Args:
+            queue: Producer-filled queue of ``(tts_text, sentence_idx, display_text)``
+                tuples; a ``None`` item terminates the loop.
+            enable_barge_in: When True, sets ``_is_agent_speaking`` so the VAD
+                barge-in path can interrupt. Should be False during document reading.
+        """
         tts_service = get_tts_service()
         tts_started = False
         tts_t0 = perf_counter()
@@ -301,7 +366,10 @@ class AgentPipeline:
                 await self._send_json({"type": "tts_start"})
             if sentence_idx is not None:
                 self._last_read_sentence_idx = sentence_idx
-                self._resume_from_sentence_idx = sentence_idx
+                # _resume_from_sentence_idx is intentionally NOT updated here.
+                # It is only used to restore a cross-session saved position before
+                # reading starts; _run_document_read clears it immediately so that
+                # in-session resumes use _last_read_sentence_idx + 1 (next sentence).
                 if self._active_document_id:
                     get_document_store().save_reading_position(self._active_document_id, sentence_idx)
                 await self._send_json({
@@ -335,6 +403,19 @@ class AgentPipeline:
         llm_ms: float,
         enable_barge_in: bool = True,
     ) -> None:
+        """Emit LLM response events then pipe utterances through _tts_sentence_pipeline.
+
+        Sends ``llm_start``, ``llm_partial``, and ``llm_final``, then delegates
+        audio synthesis and streaming to ``_tts_sentence_pipeline``.
+
+        Args:
+            user_text: The original user utterance echoed in ``llm_start``.
+            display_text: Rendered text to show in the UI.
+            utterances: Ordered list of ``(tts_text, sentence_idx, display_text)``
+                tuples to synthesise.
+            llm_ms: LLM inference latency included in the ``llm_final`` event.
+            enable_barge_in: Forwarded to ``_tts_sentence_pipeline``.
+        """
         await self._send_json({"type": "llm_start", "user_text": user_text})
         await self._send_json({"type": "llm_partial", "text": display_text})
         await self._send_json({"type": "llm_final", "text": display_text, "llm_ms": llm_ms})
@@ -364,6 +445,21 @@ class AgentPipeline:
         start_idx: int,
         llm_ms: float,
     ) -> str:
+        """Stream the requested document sentences as TTS from *start_idx* onward.
+
+        Clears ``_resume_from_sentence_idx`` immediately so in-session interrupts
+        resume via ``_last_read_sentence_idx`` rather than a stale cross-session index.
+
+        Args:
+            doc_id: Document ID to fetch from the document store.
+            user_text: Originating user utterance echoed in LLM events.
+            start_idx: Sentence index to start reading from.
+            llm_ms: LLM latency forwarded to ``_play_tts_turn``.
+
+        Returns:
+            Short status string describing what was read, or empty string if
+            the document is already finished.
+        """
         self._interrupt_event.clear()
         doc = get_document_store().get_document(doc_id)
         if not doc:
@@ -381,6 +477,9 @@ class AgentPipeline:
             return ""
 
         self._active_document_id = doc.doc_id
+        # Clear cross-session restore index now that start_idx is confirmed.
+        # Subsequent in-session interrupts will use _last_read_sentence_idx + 1.
+        self._resume_from_sentence_idx = None
         await self._send_json({
             "type": "doc_read_start",
             "doc_id": doc.doc_id,
@@ -407,6 +506,17 @@ class AgentPipeline:
     # ── LLM dispatch ──────────────────────────────────────────────────────────
 
     async def _run_llm(self, text: str, trigger: str) -> None:
+        """Run one full LLM → dispatch → TTS turn for the given user utterance.
+
+        Detects direct-read intent first (no LLM call needed), otherwise calls
+        the LLM, parses the decision, and delegates to ``_dispatch_decision`` or
+        a plain TTS turn. Fires all registered callbacks and updates conversation
+        history on success.
+
+        Args:
+            text: Normalised user utterance to process.
+            trigger: Label for session logging (e.g. ``"final"``).
+        """
         self._llm_responded = False
         self._interrupt_event.clear()
         self._latest_llm_input = text
@@ -456,8 +566,39 @@ class AgentPipeline:
             llm_ms = round((perf_counter() - llm_t0) * 1000, 2)
             logger.info("session_id={} event=llm_done llm_ms={}", self._session_id, llm_ms)
 
-            decision = parse_document_turn_response(full_response) if document_context else None
+            # Parse + Pydantic-validate the JSON decision with retries.
+            # Raw LLM JSON is never forwarded to the UI.
+            decision: DocumentTurnDecision | None = None
+            json_parse_failed = False
+            if document_context:
+                max_attempts = 1 + self._settings.llm_json_retry_attempts
+                for attempt in range(max_attempts):
+                    if attempt > 0:
+                        logger.info(
+                            "session_id={} event=llm_json_retry attempt={}/{}",
+                            self._session_id, attempt + 1, max_attempts,
+                        )
+                        full_response = await complete_llm_response(
+                            text,
+                            conversation_history=list(self._conversation_history),
+                            document_context=document_context,
+                        )
+                    try:
+                        decision = parse_document_turn_response(full_response)
+                        break
+                    except ValueError as exc:
+                        logger.warning(
+                            "session_id={} event=llm_json_invalid attempt={}/{} error={}",
+                            self._session_id, attempt + 1, max_attempts, exc,
+                        )
+                else:
+                    json_parse_failed = True
+                    logger.error(
+                        "session_id={} event=llm_json_retry_exhausted attempts={}",
+                        self._session_id, max_attempts,
+                    )
 
+            # Pattern-based overrides take priority over the LLM decision.
             if self._active_document_id and CONTINUE_READING_PATTERN.match(text):
                 active_doc = get_document_store().get_document(self._active_document_id)
                 if active_doc:
@@ -479,7 +620,17 @@ class AgentPipeline:
 
             if decision is not None:
                 display_response = await self._dispatch_decision(text, decision, llm_ms)
+            elif json_parse_failed:
+                # All retries exhausted — use a safe spoken fallback, never raw JSON.
+                display_response = "I'm having trouble processing that. Could you try again?"
+                await self._play_tts_turn(
+                    user_text=text,
+                    display_text=display_response,
+                    utterances=self._split_text_for_tts(display_response),
+                    llm_ms=llm_ms,
+                )
             else:
+                # No document context — plain-text LLM response is safe to speak directly.
                 display_response = full_response.strip()
                 await self._play_tts_turn(
                     user_text=text,
@@ -524,6 +675,20 @@ class AgentPipeline:
     async def _dispatch_decision(
         self, text: str, decision: DocumentTurnDecision, llm_ms: float
     ) -> str:
+        """Execute the action chosen by the LLM and return the agent's spoken response.
+
+        Handles the full set of ``DocumentTurnDecision`` actions: list_documents,
+        ask_document_clarification, pause_reading, read_document, continue_reading,
+        save_note, highlight_sentence, open_document, web_search, and fallback.
+
+        Args:
+            text: Original user utterance used to echo in TTS events.
+            decision: Parsed LLM decision containing action and metadata.
+            llm_ms: LLM latency forwarded to ``_play_tts_turn``.
+
+        Returns:
+            The text the agent spoke aloud.
+        """
         display_response = ""
 
         if decision.action == "list_documents":
@@ -587,15 +752,12 @@ class AgentPipeline:
                     )
                     display_response = response_text
                 else:
+                    # continue_reading must never restart; guard against LLM hallucination.
+                    if decision.action == "continue_reading":
+                        decision.restart_from_beginning = False
                     if decision.restart_from_beginning:
                         self._last_read_sentence_idx = -1
                         self._resume_from_sentence_idx = None
-                    elif (
-                        decision.action == "continue_reading"
-                        and self._resume_from_sentence_idx is None
-                        and self._last_read_sentence_idx < 0
-                    ):
-                        self._resume_from_sentence_idx = 0
                     display_response = await self._run_document_read(
                         doc_id=target_doc.doc_id,
                         user_text=text,
@@ -632,7 +794,9 @@ class AgentPipeline:
 
         elif decision.action == "highlight_sentence":
             sentence_idx = decision.sentence_idx
-            if sentence_idx is None or sentence_idx < 0:
+            # If user said "highlight this/that sentence" (vague reference to what's being read),
+            # ignore whatever index the LLM guessed and use the actual last-read position.
+            if sentence_idx is None or sentence_idx < 0 or _refers_to_current_sentence(text):
                 sentence_idx = max(0, self._last_read_sentence_idx)
             color = decision.highlight_color or "yellow"
             if not self._active_document_id:

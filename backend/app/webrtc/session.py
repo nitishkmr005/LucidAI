@@ -27,15 +27,7 @@ _RTC_CONFIG = RTCConfiguration(
 
 
 class WebRTCSession:
-    """
-    One WebRTC peer-connection per browser tab.
-
-    Audio arrives as RTP (Opus → PCM via aiortc/av).
-    All JSON signalling travels over an ordered RTCDataChannel named "signaling".
-
-    Args:
-        session_id: Short hex ID shared with the frontend as `request_id`.
-    """
+    """One WebRTC peer-connection per browser tab: RTP audio → VAD → STT → AgentPipeline."""
 
     def __init__(self, session_id: str, initial_voice: str | None = None) -> None:
         self.session_id = session_id
@@ -76,6 +68,7 @@ class WebRTCSession:
         self._register_pc_handlers()
 
     def _clear_audio_buffer(self) -> None:
+        """Resets PCM buffer and VAD after a turn completes so stale audio never re-triggers LLM."""
         self._pcm_buffer.clear()
         self._last_text_sent = ""
         self._chunk_count = 0
@@ -86,6 +79,7 @@ class WebRTCSession:
     # ── Peer-connection lifecycle ────────────────────────────────────────────
 
     def _register_pc_handlers(self) -> None:
+        """Attaches aiortc callbacks for audio track, data channel, and connection state."""
         @self.pc.on("track")
         def on_track(track: MediaStreamTrack) -> None:
             if track.kind == "audio":
@@ -113,6 +107,15 @@ class WebRTCSession:
                 await self._cleanup()
 
     async def setup(self, offer_sdp: str, offer_type: str) -> RTCSessionDescription:
+        """Complete the SDP offer/answer exchange and return the local answer.
+
+        Args:
+            offer_sdp: SDP string from the browser's RTCPeerConnection offer.
+            offer_type: SDP type, typically ``"offer"``.
+
+        Returns:
+            Local RTCSessionDescription to send back to the browser.
+        """
         await self.pc.setRemoteDescription(
             RTCSessionDescription(sdp=offer_sdp, type=offer_type)
         )
@@ -123,11 +126,17 @@ class WebRTCSession:
     # ── Data-channel open / message ──────────────────────────────────────────
 
     async def _on_dc_open(self) -> None:
+        """Sends the ready signal and starts the spoken welcome message."""
         logger.info("session_id={} event=dc_open", self.session_id)
         await self._send_json({"type": "ready", "request_id": self.session_id})
         asyncio.ensure_future(self._pipeline.run_welcome())
 
     async def _handle_dc_message(self, raw: str) -> None:
+        """Route each frontend data-channel event to pipeline state updates or interrupt.
+
+        Args:
+            raw: Raw JSON string received over the data channel.
+        """
         try:
             payload = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
@@ -193,6 +202,7 @@ class WebRTCSession:
         elif event_type == "continue_reading":
             fallback_doc_id = str(payload.get("doc_id", ""))
             if not self._pipeline.active_document_id and fallback_doc_id:
+                # Restore document state when resuming after a WebRTC reconnect.
                 doc = get_document_store().get_document(fallback_doc_id)
                 if doc:
                     self._pipeline.active_document_id = fallback_doc_id
@@ -277,6 +287,11 @@ class WebRTCSession:
     # ── RTP audio consumer ────────────────────────────────────────────────────
 
     async def _consume_audio(self, track: MediaStreamTrack) -> None:
+        """Drain RTP frames, resample to 16 kHz mono PCM, run VAD/barge-in, and feed partial STT.
+
+        Args:
+            track: Incoming audio MediaStreamTrack from the WebRTC peer connection.
+        """
         resampler = av.AudioResampler(format="s16", layout="mono", rate=16_000)
         logger.info("session_id={} event=audio_consumer_started", self.session_id)
 
@@ -322,6 +337,7 @@ class WebRTCSession:
                             if not self._pipeline.is_agent_speaking:
                                 self._schedule_speech_finalization("vad_end")
                 elif self._pipeline.is_agent_speaking:
+                    # Fallback RMS gate when dedicated VAD is disabled.
                     samples = resampled.to_ndarray().astype(np.float32) / 32_768.0
                     rms = float(np.sqrt(np.mean(samples ** 2)))
                     if rms > _BARGE_IN_THRESHOLD:
@@ -340,6 +356,7 @@ class WebRTCSession:
         logger.info("session_id={} event=audio_consumer_stopped", self.session_id)
 
     async def _maybe_emit_stt(self) -> None:
+        """Throttled partial STT emitter — skips when finalization or LLM is already in-flight."""
         if not self._pcm_buffer:
             return
         if self._speech_finalization_task and not self._speech_finalization_task.done():
@@ -383,6 +400,11 @@ class WebRTCSession:
         self._last_emit_at = perf_counter()
 
     def _transcribe_buffer(self) -> dict:
+        """Write the PCM buffer to a temp WAV and run STT; safe to call in a thread executor.
+
+        Returns:
+            Dict with keys ``text``, ``timings_ms``, and ``debug``.
+        """
         started_at = perf_counter()
         temp_path = self._settings.temp_dir / f"{self.session_id}_rtc.wav"
         try:
@@ -414,6 +436,11 @@ class WebRTCSession:
             temp_path.unlink(missing_ok=True)
 
     def _schedule_speech_finalization(self, trigger: str) -> None:
+        """Guard against duplicate finalization tasks — only one runs at a time.
+
+        Args:
+            trigger: Label forwarded to ``_finalize_speech_turn`` for logging.
+        """
         if self._speech_finalization_task and not self._speech_finalization_task.done():
             return
         self._speech_finalization_task = asyncio.create_task(
@@ -421,6 +448,11 @@ class WebRTCSession:
         )
 
     async def _finalize_speech_turn(self, trigger: str) -> None:
+        """Transcribe the completed utterance and fire the LLM — skips if agent is still speaking.
+
+        Args:
+            trigger: Label used in ``schedule_llm`` for session logging.
+        """
         try:
             if not self._pcm_buffer:
                 return
@@ -471,6 +503,7 @@ class WebRTCSession:
     # ── Interrupt ─────────────────────────────────────────────────────────────
 
     async def _handle_interrupt(self) -> None:
+        """Clears audio/VAD state and cancels pipeline tasks; preserves document reading position."""
         self._barge_in_count = 0
         self._pcm_buffer.clear()
         self._last_text_sent = ""
@@ -492,6 +525,12 @@ class WebRTCSession:
     # ── Silence debounce ──────────────────────────────────────────────────────
 
     async def _silence_debounce_then_fire(self, text: str, trigger: str) -> None:
+        """Fire LLM (or speech finalization when VAD is on) after the configured silence gap.
+
+        Args:
+            text: Transcript text to pass to ``schedule_llm`` when VAD is disabled.
+            trigger: Label for session logging.
+        """
         try:
             await asyncio.sleep(self._settings.stream_llm_silence_ms / 1000)
         except asyncio.CancelledError:
@@ -504,6 +543,11 @@ class WebRTCSession:
     # ── Helpers ──────────────────────────────────────────────────────────────
 
     async def _send_json(self, payload: dict) -> None:
+        """Send JSON over the data channel; silently drops the message if the channel is closed.
+
+        Args:
+            payload: JSON-serialisable dict to send to the browser.
+        """
         async with self._send_lock:
             if self.dc and self.dc.readyState == "open":
                 try:
@@ -514,6 +558,7 @@ class WebRTCSession:
                     )
 
     async def _cleanup(self) -> None:
+        """Idempotent teardown — cancels background tasks and interrupts the pipeline."""
         if self._closed:
             return
         self._closed = True

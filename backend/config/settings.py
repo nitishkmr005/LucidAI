@@ -86,6 +86,9 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 100
     # Number of user+assistant turn pairs to keep in context.
     llm_max_history_turns: int = 6
+    # Extra LLM calls to make when the JSON response fails Pydantic validation.
+    # 0 = no retries (fail immediately). Each retry re-calls the LLM.
+    llm_json_retry_attempts: int = 2
     # Sentences of TTS reading history to include as Q&A context (last N read).
     llm_reading_context_sentences: int = 3
     llm_system_prompt: str = VOICE_AGENT_PROMPT
