@@ -28,3 +28,15 @@ along with highilighting word it is reading on docuemnt reader way it was doing 
 where user was not understanding specific sentence in document) for a sentence it needs to save it and have hyperlink attached to that sentence in document
 reader. when clicked on that sentence notes should pop up. 5) Also user might asks agent to highlight the sentence which they feel is important that needs
 to be highlighted using different color.
+
+[Image #1] This design is not looking good for orb and Live transcript area. If needed use frontend design skill   
+
+
+1) Can you add openai llm call and i should be able to switch easily between ollama based llm call and open api call. Also in case in future if i add
+gemini/anthropic api call, i should be able to switch easily in just config/setting.py 2) [Image #2] this is how character in every line is coming in live 
+transcript. 3) Also purple color is not consistent across all different layouts like document library. 3) add resume reading button in reading mode         
+[Image #3] so that it can resume from where it left 4) When i ask question in the middle of reading LLM should take only last 2-3 sentence which was read   
+by TTS model as context along with user query to answer 5) Once user says start reading from where you left its like clicking resume reading button where   
+it needs to resume reading 6) LLM should get context like which document use has clicked in UI, based on that LLM should be intelligent enough to           
+understand which document user is saying to read 7) if user didnt click any doc in UI and user says read specific document LLM should help us to open that  
+document intelligenlty in UI 

@@ -55,6 +55,9 @@ type DocumentPanelProps = {
   pendingSnippetTerm?: string | null;
   pendingSnippetExplanation?: string | null;
   onSelectionChange?: (docId: string | null) => void;
+  onReadSelectedDocument?: () => void;
+  onResumeReading?: () => void;
+  onPauseReading?: () => void;
 };
 
 function renderInlineMarkdown(text: string, keyPrefix: string): ReactNode[] {
@@ -449,7 +452,7 @@ function renderMarkdownDocument(rawMarkdown: string, options: MarkdownRendererOp
   return nodes;
 }
 
-export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplanation, onSelectionChange }: DocumentPanelProps) {
+export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplanation, onSelectionChange, onReadSelectedDocument, onResumeReading, onPauseReading }: DocumentPanelProps) {
   const [documents, setDocuments] = useState<DocumentMeta[]>([]);
   const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
@@ -458,6 +461,7 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
   const [docTitle, setDocTitle] = useState<string>("");
   const [activeSentenceIdx, setActiveSentenceIdx] = useState<number | null>(null);
   const [activeWordIdx, setActiveWordIdx] = useState<number | null>(null);
+  const [wasReadingBefore, setWasReadingBefore] = useState(false);
   const [snippets, setSnippets] = useState<Map<number, Snippet[]>>(new Map());
   const [highlights, setHighlights] = useState<Map<number, string>>(new Map());
   const [openSnippetId, setOpenSnippetId] = useState<string | null>(null);
@@ -486,7 +490,8 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
   useEffect(() => {
     sentenceRefs.current.clear();
     setOpenSnippetId(null);
-  }, [rawMarkdown, selectedDocId]);
+    setWasReadingBefore(false);
+  }, [selectedDocId]);
 
   useEffect(() => {
     if (activeSentenceIdx === null) return;
@@ -545,12 +550,15 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
     } else if (event.type === "tts_word_tick") {
       setActiveSentenceIdx(event.sentence_idx);
       setActiveWordIdx(event.word_idx);
+      setWasReadingBefore(true);
     } else if (event.type === "tts_interrupted") {
       setActiveSentenceIdx(null);
       setActiveWordIdx(null);
       setIsReading(false);
+      setWasReadingBefore(true);
     } else if (event.type === "doc_reading_pause") {
       setIsReading(false);
+      setWasReadingBefore(true);
     } else if (event.type === "doc_reading_resume") {
       setIsReading(true);
     } else if (event.type === "doc_note_saved") {
@@ -702,13 +710,39 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
           </div>
           <div className="doc-panel-status">
             <span className="status-pill is-ghost">{documents.length.toLocaleString()} documents</span>
-            {isReading ? (
-              <span className="mode-chip active-listening">
-                <span className="mode-chip-dot" aria-hidden="true" /> Reading
-              </span>
+            {selectedDocId && isReading ? (
+              <button
+                type="button"
+                className="doc-read-button doc-read-button--pause"
+                onClick={onPauseReading}
+              >
+                Pause
+              </button>
+            ) : selectedDocId && wasReadingBefore ? (
+              <button
+                type="button"
+                className="doc-read-button doc-read-button--resume"
+                onClick={onResumeReading}
+              >
+                Resume
+              </button>
+            ) : selectedDocId ? (
+              <button
+                type="button"
+                className="doc-read-button"
+                onClick={onReadSelectedDocument}
+              >
+                Read aloud
+              </button>
             ) : null}
-            {activeWordText ? (
-              <span className="doc-word-pill">Live word: {activeWordText}</span>
+            {selectedDocId && wasReadingBefore ? (
+              <button
+                type="button"
+                className="doc-read-button doc-read-button--restart"
+                onClick={onReadSelectedDocument}
+              >
+                Restart
+              </button>
             ) : null}
           </div>
         </header>
@@ -728,6 +762,8 @@ export function DocumentPanel({ event, pendingSnippetTerm, pendingSnippetExplana
               documents={documents}
               selectedDocId={selectedDocId}
               isUploading={isUploading}
+              readingDocId={isReading ? selectedDocId : null}
+              readingSentenceIdx={isReading ? activeSentenceIdx : null}
               onUpload={handleUpload}
               onSelect={handleSelectDoc}
               onDelete={handleDeleteDoc}

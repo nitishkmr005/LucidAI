@@ -58,17 +58,36 @@ class Settings(BaseSettings):
     # Spoken greeting on session start. Set to "" to disable.
     welcome_message: str = "Hello! I'm your Neurotalk voice assistant. How can I assist you today?"
 
-    # ── LLM — Ollama ─────────────────────────────────────────────────────────
+    # ── LLM provider — switch via LLM_PROVIDER env var ──────────────────────
+    # Options: "ollama" | "openai" | "anthropic" | "gemini"
+    llm_provider: str = "openai"
+
+    # Ollama
     ollama_host: str = "http://localhost:11434"
     # Recommended models (ollama pull <model>):
     #   qwen3:4b   — fast, strong tool-calling, low memory  (recommended)
     #   qwen3:8b   — higher quality, ~2x slower
     #   gemma3:1b  — fastest, minimal memory, lower quality
     #   gemma4:latest — high quality, large (9.6 GB)
-    llm_model: str = "llama3.2:3b"#"qwen3.5:2b"#"gemma4:26b"#"llama3.2:3b" #"gemma3:1b"
+    llm_model: str = "llama3.2:3b"
+
+    # OpenAI
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4o-mini"
+
+    # Anthropic (future)
+    anthropic_api_key: str = ""
+    anthropic_model: str = "claude-sonnet-4-6"
+
+    # Gemini (future)
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.0-flash"
+
     llm_max_tokens: int = 100
     # Number of user+assistant turn pairs to keep in context.
     llm_max_history_turns: int = 6
+    # Sentences of TTS reading history to include as Q&A context (last N read).
+    llm_reading_context_sentences: int = 3
     llm_system_prompt: str = VOICE_AGENT_PROMPT
 
     # ── Storage ───────────────────────────────────────────────────────────────

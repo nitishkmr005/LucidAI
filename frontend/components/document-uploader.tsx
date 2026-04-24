@@ -15,6 +15,8 @@ type DocumentUploaderProps = {
   documents: DocumentMeta[];
   selectedDocId: string | null;
   isUploading: boolean;
+  readingDocId?: string | null;
+  readingSentenceIdx?: number | null;
   onUpload: (file: File) => Promise<void>;
   onSelect: (docId: string) => void;
   onDelete: (docId: string) => void;
@@ -25,6 +27,8 @@ export function DocumentUploader({
   documents,
   selectedDocId,
   isUploading,
+  readingDocId = null,
+  readingSentenceIdx = null,
   onUpload,
   onSelect,
   onDelete,
@@ -33,7 +37,7 @@ export function DocumentUploader({
   const [isDragOver, setIsDragOver] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const featuredDocument = documents[0] ?? null;
+  const featuredDocument = documents.find((doc) => doc.doc_id === selectedDocId) ?? documents[0] ?? null;
 
   const handleFile = useCallback(
     async (file: File) => {
@@ -60,6 +64,20 @@ export function DocumentUploader({
     },
     [handleFile]
   );
+
+  const featuredIsReading = Boolean(featuredDocument && readingDocId === featuredDocument.doc_id);
+  const estimatedPages = featuredDocument ? Math.max(1, Math.round(featuredDocument.word_count / 260)) : 1;
+  const progressPercent = featuredDocument && featuredIsReading && readingSentenceIdx !== null
+    ? Math.max(4, Math.min(100, Math.round(((readingSentenceIdx + 1) / Math.max(featuredDocument.sentence_count, 1)) * 100)))
+    : 0;
+  const featuredStatusLabel = featuredIsReading
+    ? "Reading aloud"
+    : featuredDocument?.doc_id === selectedDocId
+      ? "Selected document"
+      : "Ready to open";
+  const featuredStatusMeta = featuredIsReading && featuredDocument
+    ? `Sentence ${Math.min(readingSentenceIdx ?? 0, featuredDocument.sentence_count - 1) + 1} of ${featuredDocument.sentence_count}`
+    : `${estimatedPages.toLocaleString()} pages`;
 
   return (
     <div className={`doc-uploader${documents.length > 0 ? " has-documents" : ""}`}>
@@ -98,8 +116,13 @@ export function DocumentUploader({
           <span className="doc-feature-content">
             <strong>{featuredDocument.title}</strong>
             <span>{featuredDocument.word_count.toLocaleString()} words · {Math.max(1, Math.round(featuredDocument.word_count / 260)).toLocaleString()} pages</span>
-            <span className="doc-progress-track"><span style={{ width: "67%" }} /></span>
-            <span className="doc-feature-footer"><span>Currently reading</span><span>Page 6 of 14</span></span>
+            {featuredIsReading ? (
+              <span className="doc-progress-track"><span style={{ width: `${progressPercent}%` }} /></span>
+            ) : null}
+            <span className={`doc-feature-footer${featuredIsReading ? " is-live" : ""}`}>
+              <span>{featuredStatusLabel}</span>
+              <span>{featuredStatusMeta}</span>
+            </span>
           </span>
         </button>
       )}

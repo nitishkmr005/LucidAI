@@ -7,6 +7,7 @@ from typing import Literal
 
 from app.prompts.system import DOCUMENT_TURN_PROMPT
 from app.services.document_store import ParsedDocument, get_document_store
+from config.settings import get_settings
 
 _JSON_OBJECT_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
 _NON_WORD_PATTERN = re.compile(r"[^a-z0-9]+")
@@ -30,6 +31,8 @@ DocumentAction = Literal[
     "list_documents",
     "save_note",
     "highlight_sentence",
+    "web_search",
+    "open_document",
 ]
 
 
@@ -143,9 +146,10 @@ def build_document_turn_context(
                 lines.append("Relevant selected-document excerpts:")
                 lines.extend(f"[{idx}] {sentence}" for idx, sentence in excerpt)
             if last_read_sentence_idx >= 0:
-                start = max(0, last_read_sentence_idx - 12)
+                context_window = max(1, get_settings().llm_reading_context_sentences - 1)
+                start = max(0, last_read_sentence_idx - context_window)
                 end = min(len(doc.sentences), last_read_sentence_idx + 1)
-                lines.append("Document reading history up to the current point:")
+                lines.append("Document reading history up to the current point (last sentences read aloud):")
                 lines.extend(f"[{idx}] {doc.sentences[idx]}" for idx in range(start, end))
         else:
             lines.extend(["", "Selected document: none"])
@@ -176,6 +180,8 @@ def parse_document_turn_response(raw: str) -> DocumentTurnDecision:
         "list_documents",
         "save_note",
         "highlight_sentence",
+        "web_search",
+        "open_document",
     }:
         action = "answer"
 

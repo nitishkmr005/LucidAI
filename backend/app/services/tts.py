@@ -121,10 +121,16 @@ class TTSService:
             return voice
         return _DEFAULT_VOICE
 
-    def _run_inference(self, text: str, voice: str | None = None) -> tuple[bytes, int]:
-        return self._run_kokoro(text, self._resolve_voice(voice)) if self._backend == "kokoro" else self._run_chatterbox(text)
+    def _resolve_speed(self, speed: float | None) -> float:
+        if speed is None:
+            return _KOKORO_SPEED
+        return max(0.8, min(1.3, float(speed)))
 
-    def _run_kokoro(self, text: str, voice: str) -> tuple[bytes, int]:
+    def _run_inference(self, text: str, voice: str | None = None, speed: float | None = None) -> tuple[bytes, int]:
+        resolved_speed = self._resolve_speed(speed)
+        return self._run_kokoro(text, self._resolve_voice(voice), resolved_speed) if self._backend == "kokoro" else self._run_chatterbox(text)
+
+    def _run_kokoro(self, text: str, voice: str, speed: float) -> tuple[bytes, int]:
         from app.utils.emotion import strip_emotion_tags
         clean = strip_emotion_tags(text)
         final_audio = None
@@ -132,7 +138,7 @@ class TTSService:
         voice_path = _kokoro_voice_path(voice)
         if not voice_path.exists():
             raise FileNotFoundError(f"Local Kokoro voice not found: {voice_path}")
-        for result in self._model.generate(clean, voice=str(voice_path), speed=_KOKORO_SPEED, lang_code=_KOKORO_LANG):
+        for result in self._model.generate(clean, voice=str(voice_path), speed=speed, lang_code=_KOKORO_LANG):
             final_audio = result.audio
             sample_rate = getattr(result, "sample_rate", 24000)
         if final_audio is None:
@@ -164,7 +170,7 @@ class TTSService:
             wf.writeframes(pcm16.tobytes())
         return buf.getvalue(), self._model.sr
 
-    async def synthesize(self, text: str, voice: str | None = None) -> tuple[bytes, int]:
+    async def synthesize(self, text: str, voice: str | None = None, speed: float | None = None) -> tuple[bytes, int]:
         if self._model is None:
             async with self._load_lock:
                 if self._model is None:
@@ -173,12 +179,13 @@ class TTSService:
         loop = asyncio.get_event_loop()
         started_at = perf_counter()
         resolved_voice = self._resolve_voice(voice)
-        wav_bytes, sample_rate = await loop.run_in_executor(None, self._run_inference, text, resolved_voice)
+        resolved_speed = self._resolve_speed(speed)
+        wav_bytes, sample_rate = await loop.run_in_executor(None, self._run_inference, text, resolved_voice, resolved_speed)
         latency_ms = round((perf_counter() - started_at) * 1000, 2)
         log_module_io(
             module="tts",
             latency_ms=latency_ms,
-            input_payload={"text": text, "backend": self._backend, "voice": resolved_voice},
+            input_payload={"text": text, "backend": self._backend, "voice": resolved_voice, "speed": resolved_speed},
             output_payload={"audio_bytes": len(wav_bytes), "sample_rate": sample_rate},
         )
         return wav_bytes, sample_rate

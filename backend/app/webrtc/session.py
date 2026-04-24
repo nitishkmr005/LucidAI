@@ -38,7 +38,13 @@ _PAUSE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _CONTINUE_READING_PATTERN = re.compile(
-    r"^\s*(keep reading|continue reading|continue|resume reading|resume)\s*[.!?,]?\s*$",
+    r"^\s*("
+    r"keep reading|continue reading|continue|resume reading|resume|"
+    r"start reading from where (you|we) left( off)?|"
+    r"(continue|carry on|go on) from where (you|we) (stopped|left|paused|were)|"
+    r"pick up (where|from) (you|we) left( off)?|"
+    r"go on|carry on"
+    r")\s*[.!?,]?\s*$",
     re.IGNORECASE,
 )
 _READ_FROM_BEGINNING_PATTERN = re.compile(
@@ -101,6 +107,7 @@ class WebRTCSession:
         self._resume_from_sentence_idx: int | None = None
         self._last_answer_text: str = ""
         self._tts_voice: str = self._resolve_tts_voice(initial_voice)
+        self._tts_speed: float = 1.0
 
         # Barge-in state
         self._is_agent_speaking = False
@@ -194,6 +201,10 @@ class WebRTCSession:
             self._tts_voice = resolved_voice
             logger.info("session_id={} event=tts_voice_selected voice={}", self.session_id, resolved_voice)
 
+        elif event_type == "tts_speed":
+            self._tts_speed = max(0.8, min(1.3, float(payload.get("speed", 1.0))))
+            logger.info("session_id={} event=tts_speed_selected speed={}", self.session_id, self._tts_speed)
+
         elif event_type == "interrupt":
             logger.info("session_id={} event=interrupt_received", self.session_id)
             await self._handle_interrupt()
@@ -206,6 +217,11 @@ class WebRTCSession:
                 self._last_read_sentence_idx = -1
                 self._resume_from_sentence_idx = None
                 annotations = get_document_store().load_annotations(doc_id)
+                if rp := annotations.get("reading_position"):
+                    saved_idx = rp.get("last_sentence_idx")
+                    if isinstance(saved_idx, int) and saved_idx >= 0:
+                        self._resume_from_sentence_idx = saved_idx
+                        self._last_read_sentence_idx = max(-1, saved_idx - 1)
                 await self._send_json({
                     "type": "doc_opened",
                     "doc_id": doc_id,
@@ -222,6 +238,12 @@ class WebRTCSession:
             self._active_document_id = None
             self._last_read_sentence_idx = -1
             self._resume_from_sentence_idx = None
+
+        elif event_type == "pause_reading":
+            if self._llm_task and not self._llm_task.done():
+                await self._handle_interrupt()
+                await self._send_json({"type": "doc_reading_pause"})
+                logger.info("session_id={} event=pause_reading_button", self.session_id)
 
         elif event_type == "continue_reading":
             if self._active_document_id and (self._llm_task is None or self._llm_task.done()):
@@ -241,6 +263,31 @@ class WebRTCSession:
                         await self._send_json({"type": "doc_reading_pause"})
                 else:
                     await self._send_json({"type": "doc_reading_pause"})
+
+        elif event_type == "doc_read":
+            doc_id = str(payload.get("doc_id", ""))
+            restart_from_beginning = bool(payload.get("restart_from_beginning"))
+            doc = get_document_store().get_document(doc_id)
+            if not doc:
+                await self._send_json({"type": "doc_error", "message": f"Document '{doc_id}' not found."})
+                return
+            self._active_document_id = doc_id
+            annotations = get_document_store().load_annotations(doc_id)
+            self._resume_from_sentence_idx = None
+            self._last_read_sentence_idx = -1
+            if not restart_from_beginning and (rp := annotations.get("reading_position")):
+                saved_idx = rp.get("last_sentence_idx")
+                if isinstance(saved_idx, int) and saved_idx >= 0:
+                    self._resume_from_sentence_idx = saved_idx
+                    self._last_read_sentence_idx = max(-1, saved_idx - 1)
+            self._llm_task = asyncio.ensure_future(
+                self._run_document_read(
+                    doc_id=doc.doc_id,
+                    user_text="",
+                    start_idx=self._get_read_start_idx(restart_from_beginning=restart_from_beginning),
+                    llm_ms=0.0,
+                )
+            )
 
         elif event_type == "doc_save_highlight":
             doc_id = str(payload.get("doc_id", ""))
@@ -600,7 +647,7 @@ class WebRTCSession:
                 break
             tts_text, sentence_idx, display_text = item
             try:
-                wav_bytes, sr = await tts_service.synthesize(tts_text, voice=self._tts_voice)
+                wav_bytes, sr = await tts_service.synthesize(tts_text, voice=self._tts_voice, speed=self._tts_speed)
             except Exception as err:
                 logger.warning(
                     "session_id={} event=tts_error error={}", self.session_id, err
@@ -823,7 +870,7 @@ class WebRTCSession:
                     )
                     display_response = response_text
                 elif decision.action in {"read_document", "continue_reading"}:
-                    if decision.action == "read_document" and not user_explicitly_named_document(text):
+                    if decision.action == "read_document" and not user_explicitly_named_document(text) and not self._active_document_id:
                         response_text = "Which document should I read?"
                         await self._play_tts_turn(
                             user_text=text,
@@ -897,6 +944,55 @@ class WebRTCSession:
                             "color": color,
                         })
                         response_text = decision.response_text or "Highlighted that sentence."
+                    await self._play_tts_turn(
+                        user_text=text,
+                        display_text=response_text,
+                        utterances=self._split_text_for_tts(response_text),
+                        llm_ms=llm_ms,
+                    )
+                    display_response = response_text
+                elif decision.action == "open_document":
+                    target_doc = resolve_document_by_name(
+                        decision.document_name,
+                        active_document_id=None,
+                    )
+                    if target_doc is None:
+                        response_text = decision.response_text or "I couldn't find that document. Which one would you like?"
+                        await self._play_tts_turn(
+                            user_text=text,
+                            display_text=response_text,
+                            utterances=self._split_text_for_tts(response_text),
+                            llm_ms=llm_ms,
+                        )
+                        display_response = response_text
+                    else:
+                        self._active_document_id = target_doc.doc_id
+                        self._last_read_sentence_idx = -1
+                        self._resume_from_sentence_idx = None
+                        annotations = get_document_store().load_annotations(target_doc.doc_id)
+                        await self._send_json({
+                            "type": "doc_opened",
+                            "doc_id": target_doc.doc_id,
+                            "title": target_doc.title,
+                            "raw_markdown": target_doc.raw_markdown,
+                            "sentences": target_doc.sentences,
+                            "annotations": annotations,
+                        })
+                        display_response = await self._run_document_read(
+                            doc_id=target_doc.doc_id,
+                            user_text=text,
+                            start_idx=0,
+                            llm_ms=llm_ms,
+                        )
+                elif decision.action == "web_search":
+                    query = decision.response_text or text
+                    results = await web_search(query, max_results=self._settings.web_search_max_results)
+                    await self._send_json({"type": "doc_search_result", "query": query, "results": results})
+                    if results:
+                        top = ". ".join(r.get("snippet", "") for r in results[:3] if r.get("snippet"))
+                        response_text = top or "Here is what I found online."
+                    else:
+                        response_text = "I searched but could not find relevant results."
                     await self._play_tts_turn(
                         user_text=text,
                         display_text=response_text,

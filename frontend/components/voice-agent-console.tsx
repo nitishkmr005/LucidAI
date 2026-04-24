@@ -1,9 +1,20 @@
 "use client";
 
-import { Fragment, startTransition, useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import {
+  cloneElement,
+  isValidElement,
+  startTransition,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
 import { WebRTCTransport } from "./webrtc-transport";
 import { useDocumentHighlight } from "../hooks/use-document-highlight";
 import type { DocumentEvent } from "./document-panel";
+import { VoiceOrbHero, type VoiceState } from "./voice/VoiceOrbHero";
 
 type Mode = "listening" | "thinking" | "responding" | "speaking";
 
@@ -88,7 +99,7 @@ const modeConfig: Record<
   listening: {
     eyebrow: "Listening",
     headline: "Listening",
-    summary: "Realtime speech capture is ready.",
+    summary: "Speak naturally, I'm here to help.",
     accent: "active-listening",
   },
   thinking: {
@@ -128,6 +139,9 @@ const fallbackTtsVoiceIds = [
 ];
 const defaultTtsVoice = "af_heart";
 const ttsVoiceStorageKey = "neurotalk-tts-voice";
+const ttsSpeedStorageKey = "neurotalk-tts-speed";
+const ttsSpeedPresets = [0.8, 1, 1.15, 1.3];
+type VoiceSettingsSection = "voice" | "speed" | "playback";
 
 function formatVoiceName(voiceId: string): string {
   const [prefix, rawName] = voiceId.split("_");
@@ -188,10 +202,13 @@ type VoiceAgentConsoleProps = {
 
 export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEvent, onSnippetExplanation }: VoiceAgentConsoleProps = {}) {
   const [isDark, setIsDark] = useState(true);
+  const [workspaceView, setWorkspaceView] = useState<"conversation" | "reading">("conversation");
   const [transportType] = useState<TransportType>("webrtc");
   const [ttsVoices, setTtsVoices] = useState<TtsVoice[]>(FALLBACK_TTS_VOICES);
   const [selectedTtsVoice, setSelectedTtsVoice] = useState<string>(defaultTtsVoice);
+  const [selectedTtsSpeed, setSelectedTtsSpeed] = useState<number>(1);
   const [isVoiceSettingsOpen, setIsVoiceSettingsOpen] = useState(false);
+  const [voiceSettingsSection, setVoiceSettingsSection] = useState<VoiceSettingsSection>("voice");
   const [previewingVoice, setPreviewingVoice] = useState<string | null>(null);
   const [voicePreviewError, setVoicePreviewError] = useState<string | null>(null);
   const [mode, setMode] = useState<Mode>("listening");
@@ -258,12 +275,14 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
   const waveLevelsRef = useRef(initialWaveLevels);
   const startAttemptRef = useRef(0);
   const loadedDocumentIdRef = useRef<string | null>(null);
+  const pendingBackendActionRef = useRef<object | null>(null);
+  const startStreamingRef = useRef<() => Promise<void>>(async () => undefined);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
   const previewAudioUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
     const saved = localStorage.getItem("nt-theme");
-    const dark = saved !== "light";
+    const dark = saved === "dark";
     setIsDark(dark);
     document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
 
@@ -271,11 +290,20 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
     if (savedVoice && FALLBACK_TTS_VOICES.some((voice) => voice.id === savedVoice)) {
       setSelectedTtsVoice(savedVoice);
     }
+
+    const savedSpeed = Number(localStorage.getItem(ttsSpeedStorageKey));
+    if (Number.isFinite(savedSpeed) && savedSpeed >= 0.75 && savedSpeed <= 1.5) {
+      setSelectedTtsSpeed(savedSpeed);
+    }
   }, []);
 
   useEffect(() => {
     localStorage.setItem(ttsVoiceStorageKey, selectedTtsVoice);
   }, [selectedTtsVoice]);
+
+  useEffect(() => {
+    localStorage.setItem(ttsSpeedStorageKey, selectedTtsSpeed.toFixed(2));
+  }, [selectedTtsSpeed]);
 
   useEffect(() => {
     let cancelled = false;
@@ -300,6 +328,14 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
     const value = next ? "dark" : "light";
     localStorage.setItem("nt-theme", value);
     document.documentElement.setAttribute("data-theme", value);
+  };
+
+  const openVoiceSettings = () => {
+    if (isRecordingRef.current || isConnecting || mode === "speaking") {
+      stopStreaming();
+    }
+    setVoiceSettingsSection("voice");
+    setIsVoiceSettingsOpen(true);
   };
 
   useEffect(() => {
@@ -541,7 +577,12 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
             streamReadyRef.current = true;
             loadedDocumentIdRef.current = null;
             syncSelectedVoice(selectedTtsVoice);
+            syncSelectedSpeed(selectedTtsSpeed);
             syncSelectedDocument(selectedDocumentId ?? null);
+            if (pendingBackendActionRef.current) {
+              sendToBackend(pendingBackendActionRef.current);
+              pendingBackendActionRef.current = null;
+            }
             const uid = crypto.randomUUID();
             activeUserIdRef.current = uid;
             activeAssistantIdRef.current = null;
@@ -806,11 +847,17 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
           }
           if (payload.type === "doc_reading_pause") {
             isReadingModeRef.current = false;
+            void audioContextRef.current?.suspend();
+            if (revealRafRef.current !== null) {
+              cancelAnimationFrame(revealRafRef.current);
+              revealRafRef.current = null;
+            }
             onDocumentEvent?.({ type: "doc_reading_pause" });
             return;
           }
           if (payload.type === "doc_reading_resume") {
             isReadingModeRef.current = true;
+            void audioContextRef.current?.resume();
             onDocumentEvent?.({ type: "doc_reading_resume" });
             return;
           }
@@ -987,7 +1034,12 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
           streamReadyRef.current = true;
           loadedDocumentIdRef.current = null;
           syncSelectedVoice(selectedTtsVoice);
+          syncSelectedSpeed(selectedTtsSpeed);
           syncSelectedDocument(selectedDocumentId ?? null);
+          if (pendingBackendActionRef.current) {
+            sendToBackend(pendingBackendActionRef.current);
+            pendingBackendActionRef.current = null;
+          }
           // Create the user message bubble for this recording session
           const uid = crypto.randomUUID();
           activeUserIdRef.current = uid;
@@ -1223,11 +1275,17 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
         }
         if (payload.type === "doc_reading_pause") {
           isReadingModeRef.current = false;
+          void audioContextRef.current?.suspend();
+          if (revealRafRef.current !== null) {
+            cancelAnimationFrame(revealRafRef.current);
+            revealRafRef.current = null;
+          }
           onDocumentEvent?.({ type: "doc_reading_pause" });
           return;
         }
         if (payload.type === "doc_reading_resume") {
           isReadingModeRef.current = true;
+          void audioContextRef.current?.resume();
           onDocumentEvent?.({ type: "doc_reading_resume" });
           return;
         }
@@ -1282,6 +1340,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
       stopAudioGraph();
     }
   };
+  startStreamingRef.current = startStreaming;
 
   const copyTranscript = useCallback(() => {
     const text = messages
@@ -1333,7 +1392,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
       const response = await fetch(`${backendUrl}/tts/preview`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ voice: voiceId }),
+        body: JSON.stringify({ voice: voiceId, speed: selectedTtsSpeed }),
       });
       if (!response.ok) {
         throw new Error("Voice preview failed.");
@@ -1359,12 +1418,23 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
       setVoicePreviewError(err instanceof Error ? err.message : "Voice preview failed.");
       stopVoicePreview();
     }
-  }, [isConnecting, mode, stopVoicePreview]);
+  }, [isConnecting, mode, selectedTtsSpeed, stopVoicePreview]);
 
   const selectVoice = useCallback((voiceId: string) => {
     setSelectedTtsVoice(voiceId);
     void previewVoice(voiceId);
   }, [previewVoice]);
+
+  const syncSelectedSpeed = useCallback((speed: number) => {
+    if (!streamReadyRef.current) {
+      return;
+    }
+    sendToBackend({ type: "tts_speed", speed });
+  }, [sendToBackend]);
+
+  useEffect(() => {
+    syncSelectedSpeed(selectedTtsSpeed);
+  }, [selectedTtsSpeed, syncSelectedSpeed]);
 
   const syncSelectedDocument = useCallback((docId: string | null) => {
     if (!streamReadyRef.current) {
@@ -1390,8 +1460,48 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
     syncSelectedDocument(selectedDocumentId ?? null);
   }, [selectedDocumentId, syncSelectedDocument]);
 
+  const requestDocumentRead = useCallback(() => {
+    if (!selectedDocumentId || isConnecting || isFinalizing) {
+      return;
+    }
+    setWorkspaceView("reading");
+    const action = { type: "doc_read", doc_id: selectedDocumentId, restart_from_beginning: true };
+    if (isRecordingRef.current) {
+      sendToBackend(action);
+      return;
+    }
+    pendingBackendActionRef.current = action;
+    void startStreamingRef.current();
+  }, [isConnecting, isFinalizing, selectedDocumentId, sendToBackend]);
+
+  const requestDocumentResume = useCallback(() => {
+    if (!selectedDocumentId || isConnecting || isFinalizing) {
+      return;
+    }
+    setWorkspaceView("reading");
+    const action = { type: "continue_reading" };
+    if (isRecordingRef.current) {
+      sendToBackend(action);
+      return;
+    }
+    pendingBackendActionRef.current = action;
+    void startStreamingRef.current();
+  }, [isConnecting, isFinalizing, selectedDocumentId, sendToBackend]);
+
+  const requestPauseReading = useCallback(() => {
+    if (isConnecting || isFinalizing) return;
+    const action = { type: "pause_reading" };
+    if (isRecordingRef.current) {
+      sendToBackend(action);
+      return;
+    }
+    pendingBackendActionRef.current = action;
+    void startStreamingRef.current();
+  }, [isConnecting, isFinalizing, sendToBackend]);
+
   const stopStreaming = () => {
     startAttemptRef.current += 1;
+    pendingBackendActionRef.current = null;
     const wasConnecting = isConnecting;
     setIsConnecting(false);
     setIsRecording(false);
@@ -1441,16 +1551,28 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
   const activeMode = modeConfig[mode];
   const controlLabel = isRecording || isConnecting ? "Stop Streaming" : "Start Live Transcription";
   const controlDisabled = isFinalizing;
-  const orbScale = (1 + amplitude * 0.42).toFixed(3);
-  const orbGlow = (0.45 + amplitude * 1.3).toFixed(3);
-  const orbTilt = `${(amplitude * 18).toFixed(2)}deg`;
-  const orbCoreScale = (1 + amplitude * 0.34).toFixed(3);
-  const orbDriftX = `${(amplitude * 12).toFixed(2)}px`;
-  const orbDriftY = `${(amplitude * -10).toFixed(2)}px`;
+  const orbState: VoiceState =
+    isFinalizing || mode === "thinking" || mode === "responding"
+      ? "thinking"
+      : mode === "speaking"
+        ? "speaking"
+        : error
+          ? "interrupted"
+          : (!isRecording && !isConnecting)
+            ? "idle"
+            : "listening";
   const selectedVoice = ttsVoices.find((voice) => voice.id === selectedTtsVoice) ?? ttsVoices[0] ?? FALLBACK_TTS_VOICES[0];
   const voicePreviewDisabled = isRecording || isConnecting || mode === "speaking";
   const selectedVoiceIndex = Math.max(0, ttsVoices.findIndex((voice) => voice.id === selectedVoice.id));
   const selectedVoiceLabel = getVoiceLabel(selectedVoice);
+  const injectedDocumentWorkspace = isValidElement(children)
+    ? cloneElement(children, {
+        onReadSelectedDocument: requestDocumentRead,
+        onResumeReading: requestDocumentResume,
+        onPauseReading: requestPauseReading,
+        layoutMode: workspaceView === "reading" ? "reading" : "split",
+      } as Record<string, unknown>)
+    : children;
   const visibleVoiceOffsets = [-2, -1, 0, 1, 2];
   const visibleVoiceItems = visibleVoiceOffsets
     .map((offset) => {
@@ -1472,19 +1594,36 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
 
         {/* ── Topbar ──────────────────────────────────────────── */}
         <header className="topbar surface">
-          <div>
-            <p className="kicker">Document Intelligence Workspace</p>
-            <h1>NeuroTalk</h1>
-            <p className="topbar-tagline">Document Intelligence Workspace</p>
+          <div className="brand-lockup">
+            <span className="brand-mark" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+              <span />
+            </span>
+            <div className="brand-copy">
+              <h1>NeuroTalk</h1>
+              <p className="topbar-tagline">Document Intelligence Workspace</p>
+            </div>
           </div>
           <nav className="app-tabs" aria-label="Workspace mode">
-            <button type="button" className="app-tab is-active" aria-pressed="true">
+            <button
+              type="button"
+              className={workspaceView === "conversation" ? "app-tab is-active" : "app-tab"}
+              aria-pressed={workspaceView === "conversation"}
+              onClick={() => setWorkspaceView("conversation")}
+            >
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true">
                 <path d="M4 12v.01M8 7v10M12 4v16M16 8v8M20 11v2" />
               </svg>
               Conversation
             </button>
-            <button type="button" className="app-tab" aria-pressed="false">
+            <button
+              type="button"
+              className={workspaceView === "reading" ? "app-tab is-active" : "app-tab"}
+              aria-pressed={workspaceView === "reading"}
+              onClick={() => setWorkspaceView("reading")}
+            >
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                 <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
                 <path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5z" />
@@ -1498,7 +1637,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
             <button
               type="button"
               className="voice-lens-button"
-              onClick={() => setIsVoiceSettingsOpen(true)}
+              onClick={openVoiceSettings}
               aria-label="Open voice settings"
               title={selectedVoice.name}
             >
@@ -1541,20 +1680,32 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
               onClick={(event) => event.stopPropagation()}
             >
               <aside className="voice-settings-nav" aria-label="Voice settings sections">
-                <button type="button" className="voice-settings-nav-item is-active">
+                <button
+                  type="button"
+                  className={voiceSettingsSection === "voice" ? "voice-settings-nav-item is-active" : "voice-settings-nav-item"}
+                  onClick={() => setVoiceSettingsSection("voice")}
+                >
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true">
                     <path d="M4 12v.01M8 7v10M12 4v16M16 8v8M20 11v2" />
                   </svg>
                   Voice
                 </button>
-                <button type="button" className="voice-settings-nav-item">
+                <button
+                  type="button"
+                  className={voiceSettingsSection === "speed" ? "voice-settings-nav-item is-active" : "voice-settings-nav-item"}
+                  onClick={() => setVoiceSettingsSection("speed")}
+                >
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                     <path d="M4 13a8 8 0 1 1 16 0" />
                     <path d="M4 13h3l1 5h8l1-5h3" />
                   </svg>
                   Speech speed
                 </button>
-                <button type="button" className="voice-settings-nav-item">
+                <button
+                  type="button"
+                  className={voiceSettingsSection === "playback" ? "voice-settings-nav-item is-active" : "voice-settings-nav-item"}
+                  onClick={() => setVoiceSettingsSection("playback")}
+                >
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                     <path d="M11 5 6 9H3v6h3l5 4z" />
                     <path d="M16 9a5 5 0 0 1 0 6" />
@@ -1588,84 +1739,155 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
                     <span />
                   </div>
                   <p className="kicker">Voice Settings</p>
-                  <h2 id="voice-settings-title">Choose your NeuroTalk voice</h2>
-                  <p>Preview and select the voice used for reading and answers.</p>
+                  <h2 id="voice-settings-title">
+                    {voiceSettingsSection === "voice" ? "Choose your NeuroTalk voice" : voiceSettingsSection === "speed" ? "Tune reading speed" : "Playback controls"}
+                  </h2>
+                  <p>
+                    {voiceSettingsSection === "voice"
+                      ? "Preview and select the voice used for reading and answers."
+                      : voiceSettingsSection === "speed"
+                        ? "Adjust how quickly NeuroTalk reads stored document text and voice previews."
+                        : "Review the current playback behavior for spoken answers and document reading."}
+                  </p>
                 </header>
 
-                <div className="voice-carousel">
-                  <button
-                    type="button"
-                    className="voice-carousel-arrow voice-carousel-arrow--left"
-                    onClick={() => selectAdjacentVoice(-1)}
-                    aria-label="Previous voice"
-                  >
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                      <path d="m15 18-6-6 6-6" />
-                    </svg>
-                  </button>
+                {voiceSettingsSection === "voice" ? (
+                  <>
+                    <div className="voice-carousel">
+                      <button
+                        type="button"
+                        className="voice-carousel-arrow voice-carousel-arrow--left"
+                        onClick={() => selectAdjacentVoice(-1)}
+                        aria-label="Previous voice"
+                      >
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                          <path d="m15 18-6-6 6-6" />
+                        </svg>
+                      </button>
 
-                  <div className="voice-carousel-track">
-                    {visibleVoiceItems.map((item) => {
-                      const isSelected = item.voice.id === selectedTtsVoice;
-                      const isPreviewing = previewingVoice === item.voice.id;
-                      return (
+                      <div className="voice-carousel-track">
+                        {visibleVoiceItems.map((item) => {
+                          const isSelected = item.voice.id === selectedTtsVoice;
+                          const isPreviewing = previewingVoice === item.voice.id;
+                          return (
+                            <button
+                              key={`${item.voice.id}-${item.offset}`}
+                              type="button"
+                              className={[
+                                "voice-choice",
+                                `voice-choice--offset-${item.offset}`,
+                                isSelected ? "is-selected" : "",
+                                isPreviewing ? "is-previewing" : "",
+                              ].filter(Boolean).join(" ")}
+                              style={{ "--voice-index": item.index } as CSSProperties}
+                              onClick={() => selectVoice(item.voice.id)}
+                              aria-pressed={isSelected}
+                              aria-label={`Select and preview ${item.voice.name} voice`}
+                            >
+                              <span className="voice-choice-portrait" aria-hidden="true" />
+                              <span className="voice-choice-wave" aria-hidden="true">
+                                <span /><span /><span /><span />
+                              </span>
+                              <strong>{item.label.displayName}</strong>
+                              <small>{item.label.detail}</small>
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      <button
+                        type="button"
+                        className="voice-carousel-arrow voice-carousel-arrow--right"
+                        onClick={() => selectAdjacentVoice(1)}
+                        aria-label="Next voice"
+                      >
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                          <path d="m9 18 6-6-6-6" />
+                        </svg>
+                      </button>
+                    </div>
+
+                    <div className="voice-selected-copy">
+                      <div className="voice-selected-wave" aria-hidden="true">
+                        <span /><span /><span /><span /><span />
+                      </div>
+                      <h3>{selectedVoiceLabel.displayName}</h3>
+                      <p>{selectedVoiceLabel.detail}</p>
+                      <div className="voice-mini-wave" aria-hidden="true">
+                        {waveformHeights.slice(0, 18).map((height, index) => (
+                          <span key={`${height}-${index}`} style={{ "--bar-height": `${8 + (index % 5) * 5}px` } as CSSProperties} />
+                        ))}
+                      </div>
+                      <p className="voice-description">Warm, natural and empathetic. Great for conversations, reading and storytelling.</p>
+                    </div>
+                  </>
+                ) : voiceSettingsSection === "speed" ? (
+                  <section className="voice-speed-stage" aria-label="Speech speed settings">
+                    <div className="voice-speed-orb" aria-hidden="true">
+                      <span className="voice-speed-orb-ring voice-speed-orb-ring--outer" />
+                      <span className="voice-speed-orb-ring voice-speed-orb-ring--inner" />
+                      <span className="voice-speed-orb-core" />
+                    </div>
+                    <div className="voice-speed-readout">
+                      <strong>{selectedTtsSpeed.toFixed(2)}x</strong>
+                      <span>Applied to previews and document reading.</span>
+                    </div>
+                    <div className="voice-speed-slider-wrap">
+                      <input
+                        type="range"
+                        min="0.8"
+                        max="1.3"
+                        step="0.05"
+                        value={selectedTtsSpeed}
+                        onChange={(event) => setSelectedTtsSpeed(Number(event.target.value))}
+                        className="voice-speed-slider"
+                        aria-label="Speech speed"
+                      />
+                      <div className="voice-speed-scale" aria-hidden="true">
+                        <span>Slower</span>
+                        <span>Balanced</span>
+                        <span>Faster</span>
+                      </div>
+                    </div>
+                    <div className="voice-speed-presets">
+                      {ttsSpeedPresets.map((preset) => (
                         <button
-                          key={`${item.voice.id}-${item.offset}`}
+                          key={preset}
                           type="button"
-                          className={[
-                            "voice-choice",
-                            `voice-choice--offset-${item.offset}`,
-                            isSelected ? "is-selected" : "",
-                            isPreviewing ? "is-previewing" : "",
-                          ].filter(Boolean).join(" ")}
-                          style={{ "--voice-index": item.index } as CSSProperties}
-                          onClick={() => selectVoice(item.voice.id)}
-                          aria-pressed={isSelected}
-                          aria-label={`Select and preview ${item.voice.name} voice`}
+                          className={Math.abs(selectedTtsSpeed - preset) < 0.01 ? "voice-speed-chip is-active" : "voice-speed-chip"}
+                          onClick={() => setSelectedTtsSpeed(preset)}
                         >
-                          <span className="voice-choice-portrait" aria-hidden="true" />
-                          <span className="voice-choice-wave" aria-hidden="true">
-                            <span /><span /><span /><span />
-                          </span>
-                          <strong>{item.label.displayName}</strong>
-                          <small>{item.label.detail}</small>
+                          {preset.toFixed(2)}x
                         </button>
-                      );
-                    })}
-                  </div>
-
-                  <button
-                    type="button"
-                    className="voice-carousel-arrow voice-carousel-arrow--right"
-                    onClick={() => selectAdjacentVoice(1)}
-                    aria-label="Next voice"
-                  >
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                      <path d="m9 18 6-6-6-6" />
-                    </svg>
-                  </button>
-                </div>
-
-                <div className="voice-selected-copy">
-                  <div className="voice-selected-wave" aria-hidden="true">
-                    <span /><span /><span /><span /><span />
-                  </div>
-                  <h3>{selectedVoiceLabel.displayName}</h3>
-                  <p>{selectedVoiceLabel.detail}</p>
-                  <div className="voice-mini-wave" aria-hidden="true">
-                    {waveformHeights.slice(0, 18).map((height, index) => (
-                      <span key={`${height}-${index}`} style={{ "--bar-height": `${8 + (index % 5) * 5}px` } as CSSProperties} />
-                    ))}
-                  </div>
-                  <p className="voice-description">Warm, natural and empathetic. Great for conversations, reading and storytelling.</p>
-                </div>
+                      ))}
+                    </div>
+                    <p className="voice-speed-note">
+                      Use the balanced range for long-form reading. Faster speeds work better for short answers and previews.
+                    </p>
+                  </section>
+                ) : (
+                  <section className="voice-playback-stage" aria-label="Playback behavior">
+                    <div className="voice-playback-card">
+                      <strong>Current voice</strong>
+                      <span>{selectedVoice.name}</span>
+                    </div>
+                    <div className="voice-playback-card">
+                      <strong>Speech speed</strong>
+                      <span>{selectedTtsSpeed.toFixed(2)}x</span>
+                    </div>
+                    <div className="voice-playback-card">
+                      <strong>Preview availability</strong>
+                      <span>{voicePreviewDisabled ? "Finish the live session to preview audio." : "Preview is ready."}</span>
+                    </div>
+                  </section>
+                )}
 
                 <div className="voice-settings-actions">
                   <button
                     type="button"
                     className="voice-preview-button"
                     onClick={() => previewVoice(selectedTtsVoice)}
-                    disabled={voicePreviewDisabled}
+                    disabled={voicePreviewDisabled || voiceSettingsSection !== "voice"}
                   >
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                       <path d="m8 5 11 7-11 7z" />
@@ -1685,8 +1907,8 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
                 </div>
 
                 <div className="voice-carousel-dots" aria-hidden="true">
-                  {[-2, -1, 0, 1, 2].map((dot) => (
-                    <span key={dot} className={dot === 0 ? "is-active" : undefined} />
+                  {(["voice", "speed", "playback"] as VoiceSettingsSection[]).map((dot) => (
+                    <span key={dot} className={voiceSettingsSection === dot ? "is-active" : undefined} />
                   ))}
                 </div>
 
@@ -1699,98 +1921,20 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
           </div>
         )}
 
-        <div className="console-body">
+        <div className={`console-body console-body--${workspaceView}`}>
+          {workspaceView === "conversation" ? (
           <div className="voice-workspace">
             {/* ── Orb Zone ─────────────────────────────────────────── */}
-            <div className="orb-zone surface">
-              <div className="orb-zone-header">
-                <span className={`mode-chip ${activeMode.accent}`}>
-                  {(mode === "listening" || mode === "speaking") && (
-                    <span className="mode-chip-dot" aria-hidden="true" />
-                  )}
-                  {activeMode.eyebrow}
-                </span>
-                <div className="mode-switcher">
-                  {(["listening", "thinking", "responding"] as Mode[]).map((item, index) => (
-                    <Fragment key={item}>
-                      {index > 0 && (
-                        <span className={`mode-step-line${
-                          ["listening", "thinking", "responding"].indexOf(mode) >= index ? " is-active" : ""
-                        }`} />
-                      )}
-                      <button
-                        type="button"
-                        className={item === mode ? "mode-button is-selected" : "mode-button is-static"}
-                        disabled
-                      >{item}</button>
-                    </Fragment>
-                  ))}
-                </div>
-              </div>
-
+            <div className="orb-zone surface" data-voice-state={orbState}>
               <div className="orb-stage">
                 <div className="orb-center-row">
-                  <button
-                    type="button"
-                    className={[
-                      "orbital-core",
-                      isRecording ? "orbital-core--recording" : "",
-                      isConnecting ? "orbital-core--connecting" : "",
-                    ].filter(Boolean).join(" ")}
+                  <VoiceOrbHero
+                    state={orbState}
+                    audioLevel={amplitude}
+                    className="voice-orb-hero-slot"
                     disabled={controlDisabled}
-                    onClick={isRecording || isConnecting ? stopStreaming : () => void startStreaming()}
-                    aria-label={controlLabel}
-                    style={
-                      {
-                        "--orb-scale": orbScale,
-                        "--orb-glow": orbGlow,
-                        "--orb-tilt": orbTilt,
-                        "--orb-core-scale": orbCoreScale,
-                        "--orb-drift-x": orbDriftX,
-                        "--orb-drift-y": orbDriftY,
-                      } as CSSProperties
-                    }
-                  >
-                    <div className="orb-ring orb-ring-1" />
-                    <div className="orb-ring orb-ring-2" />
-                    <div className="orb-center" />
-                    <div className="orb-scanline" />
-                  </button>
-
-                  <div className="orb-side">
-                    <p className="orb-status-title">
-                      {isFinalizing
-                        ? "Thinking..."
-                        : isConnecting && !isRecording
-                          ? "Starting..."
-                          : mode === "speaking"
-                            ? "Speaking..."
-                            : "Listening..."}
-                    </p>
-                    <p className={`orb-tap-hint${isRecording ? " is-active" : isFinalizing ? " is-muted" : ""}`}>
-                      {error
-                        ? <span className="is-error">{error}</span>
-                        : isRecording
-                          ? "Speak naturally, I'm here to help."
-                          : activeMode.summary}
-                    </p>
-                    <div className="wave-grid" aria-hidden="true">
-                      {waveformHeights.map((height, index) => (
-                        <span
-                          className="wave-bar"
-                          key={`${height}-${index}`}
-                          style={
-                            {
-                              "--bar-height": `${24 + waveLevels[index] * 90}px`,
-                              "--bar-delay": `${index * 0.03}s`,
-                              "--bar-opacity": (0.3 + waveLevels[index] * 0.7).toFixed(3),
-                              "--bar-scale": (0.82 + waveLevels[index] * 0.48).toFixed(3),
-                            } as CSSProperties
-                          }
-                        />
-                      ))}
-                    </div>
-                  </div>
+                    onActivate={isRecording || isConnecting ? stopStreaming : () => void startStreaming()}
+                  />
                 </div>
               </div>
             </div>
@@ -1798,7 +1942,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
             {/* ── Transcript Feed ─────────────────────────────────── */}
             <article className="transcript-panel surface">
               <div className="section-heading">
-                <p className="kicker">Live Transcription</p>
+                <p className="kicker">Live transcript</p>
                 <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                   <span className={`status-pill${isRecording ? " is-live" : " is-ghost"}`}>
                     {error ? "Attention needed" : isRecording ? "Live" : messages.length ? "Done" : "Ready"}
@@ -1827,17 +1971,15 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
 
               <div className="chat-thread">
                 {messages.length === 0 ? (
-                  <div className="transcript-sample" aria-label="Transcript preview">
-                    <div className="transcript-line transcript-line--user">
-                      <span className="transcript-avatar" aria-hidden="true" />
-                      <p><strong>You</strong> <span>00:12</span></p>
-                      <p>Can you explain the main idea of this document?</p>
-                    </div>
-                    <div className="transcript-line transcript-line--assistant">
-                      <span className="transcript-avatar" aria-hidden="true" />
-                      <p><strong>NeuroTalk</strong> <span>00:15</span></p>
-                      <p>The document introduces PrismDocs, an intelligent document generator that transforms complex content into clear, structured, accessible documents...</p>
-                    </div>
+                  <div className="transcript-empty" aria-label="Transcript empty state">
+                    <p className="transcript-empty-title">
+                      {selectedDocumentId ? "Ready to read the selected document." : "No conversation yet."}
+                    </p>
+                    <p className="transcript-empty-copy">
+                      {selectedDocumentId
+                        ? "Use Read document to hear the stored text, or tap the orb to ask a question first."
+                        : "Select a document from the library, then use Read document or tap the orb to begin."}
+                    </p>
                   </div>
                 ) : (
                   messages.map((msg) => (
@@ -1884,9 +2026,10 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
               </div>
             </article>
           </div>
+          ) : null}
 
           <div className="document-workspace">
-            {children}
+            {injectedDocumentWorkspace}
           </div>
         </div>
 

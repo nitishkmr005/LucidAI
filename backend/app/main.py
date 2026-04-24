@@ -59,6 +59,7 @@ _TTS_PREVIEW_MAX_CHARS = 160
 class TTSPreviewRequest(BaseModel):
     voice: str | None = None
     text: str | None = None
+    speed: float | None = None
 
 app = FastAPI(title=settings.app_name, version="0.1.0")
 app.include_router(webrtc_router)
@@ -135,7 +136,7 @@ async def preview_tts_voice(body: TTSPreviewRequest) -> Response:
     preview_text = (body.text or _TTS_PREVIEW_TEXT).strip()[:_TTS_PREVIEW_MAX_CHARS]
     if not preview_text:
         preview_text = _TTS_PREVIEW_TEXT
-    wav_bytes, _sample_rate = await get_tts_service().synthesize(preview_text, voice=voice)
+    wav_bytes, _sample_rate = await get_tts_service().synthesize(preview_text, voice=voice, speed=body.speed)
     return Response(content=wav_bytes, media_type="audio/wav")
 
 
@@ -264,6 +265,7 @@ async def transcribe_stream(websocket: WebSocket) -> None:
     last_read_sentence_idx: int = -1       # last sentence index highlighted during reading
     resume_from_sentence_idx: int | None = None
     selected_tts_voice: str = get_default_tts_voice()
+    selected_tts_speed: float = 1.0
     last_answer_text: str = ""
 
     # ── Session log scaffolding ───────────────────────────────────────────────
@@ -317,7 +319,7 @@ async def transcribe_stream(websocket: WebSocket) -> None:
             tts_text, sentence_idx, display_text = item
             synth_started_at = perf_counter()
             try:
-                wav_bytes, sr = await tts_service.synthesize(tts_text, voice=selected_tts_voice)
+                wav_bytes, sr = await tts_service.synthesize(tts_text, voice=selected_tts_voice, speed=selected_tts_speed)
             except Exception as tts_err:
                 session_log.tts_calls.append(
                     TTSCallLog(
@@ -642,6 +644,22 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                         llm_ms=llm_ms,
                     )
                     display_response = response_text
+                elif decision.action == "web_search":
+                    query = decision.response_text or text
+                    results = await web_search(query, max_results=settings.web_search_max_results)
+                    await send_json({"type": "doc_search_result", "query": query, "results": results})
+                    if results:
+                        top = ". ".join(r.get("snippet", "") for r in results[:3] if r.get("snippet"))
+                        response_text = top or "Here is what I found online."
+                    else:
+                        response_text = "I searched but could not find relevant results."
+                    await _play_tts_turn(
+                        user_text=text,
+                        display_text=response_text,
+                        utterances=_split_text_for_tts(response_text),
+                        llm_ms=llm_ms,
+                    )
+                    display_response = response_text
                 else:
                     response_text = decision.response_text or "I'm not sure how to help with that yet."
                     await _play_tts_turn(
@@ -783,6 +801,11 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                     logger.info("request_id={} event=tts_voice_selected voice={}", request_id, selected_tts_voice)
                     continue
 
+                if event_type == "tts_speed":
+                    selected_tts_speed = max(0.8, min(1.3, float(payload.get("speed", 1.0))))
+                    logger.info("request_id={} event=tts_speed_selected speed={}", request_id, selected_tts_speed)
+                    continue
+
                 if event_type == "doc_load":
                     doc_id = str(payload.get("doc_id", ""))
                     doc = get_document_store().get_document(doc_id)
@@ -828,6 +851,32 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                                 await send_json({"type": "doc_reading_pause"})
                         else:
                             await send_json({"type": "doc_reading_pause"})
+                    continue
+
+                if event_type == "doc_read":
+                    doc_id = str(payload.get("doc_id", ""))
+                    restart_from_beginning = bool(payload.get("restart_from_beginning"))
+                    doc = get_document_store().get_document(doc_id)
+                    if not doc:
+                        await send_json({"type": "doc_error", "message": f"Document '{doc_id}' not found."})
+                        continue
+                    active_document_id = doc_id
+                    last_read_sentence_idx = -1
+                    resume_from_sentence_idx = None
+                    annotations = get_document_store().load_annotations(doc_id)
+                    if not restart_from_beginning and (rp := annotations.get("reading_position")):
+                        saved_idx = rp.get("last_sentence_idx")
+                        if isinstance(saved_idx, int) and saved_idx >= 0:
+                            resume_from_sentence_idx = saved_idx
+                            last_read_sentence_idx = max(-1, saved_idx - 1)
+                    llm_task = asyncio.create_task(
+                        _run_document_read(
+                            doc_id=doc.doc_id,
+                            user_text="",
+                            start_idx=_get_read_start_idx(restart_from_beginning=restart_from_beginning),
+                            llm_ms=0.0,
+                        )
+                    )
                     continue
 
                 if event_type == "doc_save_highlight":
