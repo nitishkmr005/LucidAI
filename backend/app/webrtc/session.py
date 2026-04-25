@@ -14,8 +14,10 @@ from loguru import logger
 
 from app.services.document_store import get_document_store
 from app.services.pipeline import AgentPipeline
+from app.services.smart_turn import get_smart_turn_detector
 from app.services.stt import get_stt_service
 from app.services.vad import StreamingVAD, get_vad_service
+from app.utils.reading_patterns import PAUSE_PATTERN
 from config.settings import get_settings
 
 _BARGE_IN_THRESHOLD = 0.15
@@ -55,6 +57,7 @@ class WebRTCSession:
 
         # Background tasks
         self._audio_task: asyncio.Task | None = None
+        self._smart_turn_task: asyncio.Task | None = None
         self._closed = False
 
         # Agent pipeline — owns all LLM/TTS/conversation state
@@ -171,11 +174,6 @@ class WebRTCSession:
                 self._pipeline.last_read_sentence_idx = -1
                 self._pipeline.resume_from_sentence_idx = None
                 annotations = get_document_store().load_annotations(doc_id)
-                if rp := annotations.get("reading_position"):
-                    saved_idx = rp.get("last_sentence_idx")
-                    if isinstance(saved_idx, int) and saved_idx >= 0:
-                        self._pipeline.resume_from_sentence_idx = saved_idx
-                        self._pipeline.last_read_sentence_idx = max(-1, saved_idx - 1)
                 await self._send_json({
                     "type": "doc_opened",
                     "doc_id": doc_id,
@@ -194,27 +192,19 @@ class WebRTCSession:
             self._pipeline.resume_from_sentence_idx = None
 
         elif event_type == "pause_reading":
-            if self._pipeline.llm_task and not self._pipeline.llm_task.done():
-                await self._handle_interrupt()
-                await self._send_json({"type": "doc_reading_pause"})
-                logger.info("session_id={} event=pause_reading_button", self.session_id)
+            await self._handle_interrupt()
+            await self._send_json({"type": "doc_reading_pause"})
+            logger.info("session_id={} event=pause_reading_button", self.session_id)
 
         elif event_type == "continue_reading":
             fallback_doc_id = str(payload.get("doc_id", ""))
             if not self._pipeline.active_document_id and fallback_doc_id:
-                # Restore document state when resuming after a WebRTC reconnect.
                 doc = get_document_store().get_document(fallback_doc_id)
                 if doc:
                     self._pipeline.active_document_id = fallback_doc_id
-                    annotations = get_document_store().load_annotations(fallback_doc_id)
-                    if rp := annotations.get("reading_position"):
-                        saved_idx = rp.get("last_sentence_idx")
-                        if isinstance(saved_idx, int) and saved_idx >= 0:
-                            self._pipeline.resume_from_sentence_idx = saved_idx
-                            self._pipeline.last_read_sentence_idx = max(-1, saved_idx - 1)
                     logger.info(
-                        "session_id={} event=continue_reading_restored doc_id={} resume_idx={}",
-                        self.session_id, fallback_doc_id, self._pipeline.resume_from_sentence_idx,
+                        "session_id={} event=continue_reading_restored doc_id={}",
+                        self.session_id, fallback_doc_id,
                     )
 
             if self._pipeline.active_document_id and (
@@ -222,7 +212,8 @@ class WebRTCSession:
             ):
                 doc = get_document_store().get_document(self._pipeline.active_document_id)
                 if doc:
-                    start_idx = self._pipeline.get_read_start_idx(restart_from_beginning=False)
+                    word_idx = self._pipeline.find_resume_sentence_idx(doc.sentences)
+                    start_idx = word_idx if word_idx is not None else self._pipeline.get_read_start_idx(restart_from_beginning=False)
                     if start_idx < doc.sentence_count:
                         await self._send_json({"type": "doc_reading_resume"})
                         self._pipeline.schedule_document_read(doc.doc_id, start_idx)
@@ -241,12 +232,6 @@ class WebRTCSession:
             self._pipeline.active_document_id = doc_id
             self._pipeline.resume_from_sentence_idx = None
             self._pipeline.last_read_sentence_idx = -1
-            annotations = get_document_store().load_annotations(doc_id)
-            if not restart_from_beginning and (rp := annotations.get("reading_position")):
-                saved_idx = rp.get("last_sentence_idx")
-                if isinstance(saved_idx, int) and saved_idx >= 0:
-                    self._pipeline.resume_from_sentence_idx = saved_idx
-                    self._pipeline.last_read_sentence_idx = max(-1, saved_idx - 1)
             start_idx = self._pipeline.get_read_start_idx(restart_from_beginning=restart_from_beginning)
             self._pipeline.schedule_document_read(doc.doc_id, start_idx)
 
@@ -281,7 +266,10 @@ class WebRTCSession:
                 result = await loop.run_in_executor(None, self._transcribe_buffer)
                 await self._send_json({"type": "final", **result})
                 final_text = str(result.get("text", "")).strip()
-                if final_text and final_text != self._pipeline.latest_llm_input:
+                if final_text and PAUSE_PATTERN.match(final_text):
+                    await self._handle_interrupt()
+                    await self._send_json({"type": "doc_reading_pause"})
+                elif final_text and final_text != self._pipeline.latest_llm_input:
                     self._pipeline.schedule_llm(final_text, "final")
 
     # ── RTP audio consumer ────────────────────────────────────────────────────
@@ -320,6 +308,9 @@ class WebRTCSession:
                                 "session_id={} event=vad_speech_start sample_index={} speech_prob={}",
                                 self.session_id, vad_event.sample_index, round(vad_event.speech_prob, 4),
                             )
+                            if self._smart_turn_task and not self._smart_turn_task.done():
+                                self._smart_turn_task.cancel()
+                                self._smart_turn_task = None
                             if self._silence_debounce_task and not self._silence_debounce_task.done():
                                 self._silence_debounce_task.cancel()
                             self._silence_debounce_task = None
@@ -335,7 +326,13 @@ class WebRTCSession:
                                 self.session_id, vad_event.sample_index, round(vad_event.speech_prob, 4),
                             )
                             if not self._pipeline.is_agent_speaking:
-                                self._schedule_speech_finalization("vad_end")
+                                if self._settings.stream_smart_turn_enabled:
+                                    if self._smart_turn_task is None or self._smart_turn_task.done():
+                                        self._smart_turn_task = asyncio.create_task(
+                                            self._run_smart_turn_check()
+                                        )
+                                else:
+                                    self._schedule_speech_finalization("vad_end")
                 elif self._pipeline.is_agent_speaking:
                     # Fallback RMS gate when dedicated VAD is disabled.
                     samples = resampled.to_ndarray().astype(np.float32) / 32_768.0
@@ -435,6 +432,62 @@ class WebRTCSession:
         finally:
             temp_path.unlink(missing_ok=True)
 
+    async def _run_smart_turn_check(self) -> None:
+        """Probability-proportional Smart Turn loop after VAD end.
+
+        Re-checks end-of-turn in a loop. Wait between checks scales with how
+        incomplete the utterance appears: ``wait = base_wait × (1 - prob)``.
+        Low confidence (prob ≈ 0.08) → ~920 ms wait, giving the user time to
+        continue. High confidence (prob > threshold) → fires immediately.
+        A hard budget caps the total wait so the agent never stalls indefinitely.
+        """
+        try:
+            detector = get_smart_turn_detector()
+            base_wait_ms = self._settings.stream_smart_turn_base_wait_ms
+            max_budget_ms = self._settings.stream_smart_turn_max_budget_ms
+            elapsed_ms = 0
+
+            while True:
+                if self._pipeline.is_agent_speaking:
+                    return
+                if self._pipeline.llm_task and not self._pipeline.llm_task.done():
+                    return
+
+                pcm_snapshot = bytes(self._pcm_buffer)
+                loop = asyncio.get_event_loop()
+                is_done, prob = await loop.run_in_executor(None, detector.is_complete, pcm_snapshot)
+
+                logger.info(
+                    "session_id={} event=smart_turn_check elapsed_ms={} prob={} is_complete={}",
+                    self.session_id, elapsed_ms, round(prob, 4), is_done,
+                )
+
+                if is_done:
+                    self._schedule_speech_finalization("smart_turn")
+                    return
+
+                # prob-proportional wait: lower prob → user more mid-thought → wait longer
+                wait_ms = max(100, int(base_wait_ms * (1.0 - prob)))
+
+                if elapsed_ms + wait_ms >= max_budget_ms:
+                    logger.info(
+                        "session_id={} event=smart_turn_budget_exhausted elapsed_ms={} prob={}",
+                        self.session_id, elapsed_ms + wait_ms, round(prob, 4),
+                    )
+                    self._schedule_speech_finalization("smart_turn_timeout")
+                    return
+
+                await asyncio.sleep(wait_ms / 1000)
+                elapsed_ms += wait_ms
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("session_id={} event=smart_turn_error error={}", self.session_id, exc)
+            self._schedule_speech_finalization("smart_turn_fallback")
+        finally:
+            self._smart_turn_task = None
+
     def _schedule_speech_finalization(self, trigger: str) -> None:
         """Guard against duplicate finalization tasks — only one runs at a time.
 
@@ -495,6 +548,10 @@ class WebRTCSession:
 
             self._last_text_sent = final_text
             await self._send_json({"type": "final", **result})
+            if PAUSE_PATTERN.match(final_text):
+                await self._handle_interrupt()
+                await self._send_json({"type": "doc_reading_pause"})
+                return
             if final_text != self._pipeline.latest_llm_input:
                 self._pipeline.schedule_llm(final_text, trigger)
         finally:
@@ -511,6 +568,10 @@ class WebRTCSession:
         self._last_emit_at = 0.0
         if self._vad_stream is not None:
             self._vad_stream.reset()
+
+        if self._smart_turn_task and not self._smart_turn_task.done():
+            self._smart_turn_task.cancel()
+            self._smart_turn_task = None
 
         if self._silence_debounce_task and not self._silence_debounce_task.done():
             self._silence_debounce_task.cancel()
@@ -535,7 +596,14 @@ class WebRTCSession:
             await asyncio.sleep(self._settings.stream_llm_silence_ms / 1000)
         except asyncio.CancelledError:
             return
+        if PAUSE_PATTERN.match(text.strip()):
+            await self._handle_interrupt()
+            await self._send_json({"type": "doc_reading_pause"})
+            return
         if self._vad_stream is not None:
+            # Smart Turn is the authority when it is running — let it decide.
+            if self._smart_turn_task and not self._smart_turn_task.done():
+                return
             self._schedule_speech_finalization(trigger)
             return
         self._pipeline.schedule_llm(text, trigger)
@@ -564,6 +632,7 @@ class WebRTCSession:
         self._closed = True
         for task in (
             self._audio_task,
+            self._smart_turn_task,
             self._silence_debounce_task,
             self._speech_finalization_task,
         ):

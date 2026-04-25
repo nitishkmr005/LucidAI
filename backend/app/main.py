@@ -15,9 +15,11 @@ from app.models import HealthResponse, TranscriptionResponse
 from app.routers.documents import router as documents_router
 from app.services.document_store import get_document_store
 from app.services.pipeline import AgentPipeline
+from app.services.smart_turn import get_smart_turn_detector
 from app.services.stt import get_stt_service
 from app.services.tts import get_available_tts_voices, get_default_tts_voice, get_tts_service
 from app.services.vad import get_vad_service
+from app.utils.reading_patterns import PAUSE_PATTERN
 from app.utils.session_logger import LLMCallLog, STTRunLog, SessionLog, TTSCallLog, _iso, write_session_log
 from app.webrtc.router import router as webrtc_router
 from config.logging import setup_logging
@@ -77,6 +79,14 @@ async def _warmup_models() -> None:
         logger.info("event=tts_warmup_done ms={}", round((perf_counter() - tts_t0) * 1000))
     except Exception as err:
         logger.warning("event=tts_warmup_failed error={}", err)
+
+    if settings.stream_smart_turn_enabled:
+        st_t0 = perf_counter()
+        try:
+            await loop.run_in_executor(None, get_smart_turn_detector().warm_up)
+            logger.info("event=smart_turn_warmup_done ms={}", round((perf_counter() - st_t0) * 1000))
+        except Exception as err:
+            logger.warning("event=smart_turn_warmup_failed error={}", err)
 
 
 @app.on_event("startup")
@@ -397,6 +407,10 @@ async def transcribe_stream(websocket: WebSocket) -> None:
             await asyncio.sleep(settings.stream_llm_silence_ms / 1000)
         except asyncio.CancelledError:
             return
+        if PAUSE_PATTERN.match(text.strip()):
+            await pipeline.interrupt()
+            await send_json({"type": "doc_reading_pause"})
+            return
         pipeline.schedule_llm(text, trigger)
 
     await send_json({"type": "ready", "request_id": request_id})
@@ -436,11 +450,6 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                         pipeline.last_read_sentence_idx = -1
                         pipeline.resume_from_sentence_idx = None
                         annotations = get_document_store().load_annotations(doc_id)
-                        if rp := annotations.get("reading_position"):
-                            saved_idx = rp.get("last_sentence_idx")
-                            if isinstance(saved_idx, int) and saved_idx >= 0:
-                                pipeline.resume_from_sentence_idx = saved_idx
-                                pipeline.last_read_sentence_idx = max(-1, saved_idx - 1)
                         await send_json({
                             "type": "doc_opened",
                             "doc_id": doc_id,
@@ -466,17 +475,12 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                         doc = get_document_store().get_document(fallback_doc_id)
                         if doc:
                             pipeline.active_document_id = fallback_doc_id
-                            annotations = get_document_store().load_annotations(fallback_doc_id)
-                            if rp := annotations.get("reading_position"):
-                                saved_idx = rp.get("last_sentence_idx")
-                                if isinstance(saved_idx, int) and saved_idx >= 0:
-                                    pipeline.resume_from_sentence_idx = saved_idx
-                                    pipeline.last_read_sentence_idx = max(-1, saved_idx - 1)
 
                     if pipeline.active_document_id and (pipeline.llm_task is None or pipeline.llm_task.done()):
                         doc = get_document_store().get_document(pipeline.active_document_id)
                         if doc:
-                            start_idx = pipeline.get_read_start_idx(restart_from_beginning=False)
+                            word_idx = pipeline.find_resume_sentence_idx(doc.sentences)
+                            start_idx = word_idx if word_idx is not None else pipeline.get_read_start_idx(restart_from_beginning=False)
                             if start_idx < doc.sentence_count:
                                 await send_json({"type": "doc_reading_resume"})
                                 pipeline.schedule_document_read(doc.doc_id, start_idx)
@@ -496,12 +500,6 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                     pipeline.active_document_id = doc_id
                     pipeline.last_read_sentence_idx = -1
                     pipeline.resume_from_sentence_idx = None
-                    annotations = get_document_store().load_annotations(doc_id)
-                    if not restart_from_beginning and (rp := annotations.get("reading_position")):
-                        saved_idx = rp.get("last_sentence_idx")
-                        if isinstance(saved_idx, int) and saved_idx >= 0:
-                            pipeline.resume_from_sentence_idx = saved_idx
-                            pipeline.last_read_sentence_idx = max(-1, saved_idx - 1)
                     start_idx = pipeline.get_read_start_idx(restart_from_beginning=restart_from_beginning)
                     pipeline.schedule_document_read(doc.doc_id, start_idx)
                     continue
@@ -574,7 +572,10 @@ async def transcribe_stream(websocket: WebSocket) -> None:
                             )
                         )
 
-                        if final_text and not pipeline.llm_responded and final_text != pipeline.latest_llm_input:
+                        if final_text and PAUSE_PATTERN.match(final_text):
+                            await pipeline.interrupt()
+                            await send_json({"type": "doc_reading_pause"})
+                        elif final_text and not pipeline.llm_responded and final_text != pipeline.latest_llm_input:
                             pipeline.schedule_llm(final_text, "final")
                         elif final_text and pipeline.llm_responded:
                             logger.info("request_id={} event=final_llm_skipped reason=already_responded", request_id)

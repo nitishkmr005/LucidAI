@@ -263,6 +263,9 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
   // Counts tts_audio chunks whose decodeAudioData hasn't fired yet — prevents
   // premature finalisation when tts_done arrives before all decodes complete.
   const pendingDecodesRef = useRef(0);
+  // Monotonically-increasing counter; incremented by clearTtsQueue() so that
+  // in-flight decodeAudioData callbacks from a previous TTS session are discarded.
+  const ttsGenerationRef = useRef<number>(0);
 
   // Pending sentence for doc highlight sync
   const pendingDocSentenceIdxRef = useRef<number | null>(null);
@@ -407,6 +410,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
   }, []);
 
   const clearTtsQueue = () => {
+    ttsGenerationRef.current++;
     ttsSourceRef.current?.stop();
     ttsSourceRef.current = null;
     ttsQueueRef.current = [];
@@ -766,6 +770,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
                 : pendingDocSentenceIdxRef.current ?? undefined;
             pendingDocSentenceIdxRef.current = null;
             const chunkOrder = nextTtsChunkOrderRef.current++;
+            const capturedGeneration = ttsGenerationRef.current;
             const data = typeof payload.data === "string" ? payload.data : "";
             const binaryString = atob(data);
             const bytes = new Uint8Array(binaryString.length);
@@ -775,6 +780,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
             ttsAudioReceivedRef.current = true;
             pendingDecodesRef.current++;
             void audioCtx.decodeAudioData(bytes.buffer.slice(0), (buffer) => {
+              if (ttsGenerationRef.current !== capturedGeneration) return;
               pendingDecodesRef.current--;
               queueDecodedTtsChunk(chunkOrder, { buffer, text: sentenceText, docSentenceIdx });
             });
@@ -1202,6 +1208,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
               : pendingDocSentenceIdxRef.current ?? undefined;
           pendingDocSentenceIdxRef.current = null;
           const chunkOrder = nextTtsChunkOrderRef.current++;
+          const capturedGeneration = ttsGenerationRef.current;
           const binaryString = atob(payload.data ?? "");
           const bytes = new Uint8Array(binaryString.length);
           for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
@@ -1210,6 +1217,7 @@ export function VoiceAgentConsole({ children, selectedDocumentId, onDocumentEven
           ttsAudioReceivedRef.current = true;
           pendingDecodesRef.current++;
           void audioCtx.decodeAudioData(bytes.buffer.slice(0), (buffer) => {
+            if (ttsGenerationRef.current !== capturedGeneration) return;
             pendingDecodesRef.current--;
             queueDecodedTtsChunk(chunkOrder, { buffer, text: sentenceText, docSentenceIdx });
           });

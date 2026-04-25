@@ -38,7 +38,7 @@ tsconfig.tsbuildinfo
 # Editor
 .vscode/
 .idea/
-.claude/
+# .claude/
 *.swp
 *.swo
 

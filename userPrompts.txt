@@ -40,3 +40,6 @@ by TTS model as context along with user query to answer 5) Once user says start 
 it needs to resume reading 6) LLM should get context like which document use has clicked in UI, based on that LLM should be intelligent enough to           
 understand which document user is saying to read 7) if user didnt click any doc in UI and user says read specific document LLM should help us to open that  
 document intelligenlty in UI 
+
+
+Use simple word search to find where paused ....in progress

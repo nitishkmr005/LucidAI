@@ -77,6 +77,7 @@ class AgentPipeline:
         self._active_document_id: str | None = None
         self._last_read_sentence_idx: int = -1
         self._resume_from_sentence_idx: int | None = None
+        self._last_read_words: str = ""  # last 5 words of the most recently spoken document sentence
         self._last_answer_text: str = ""
         self._tts_voice: str = self._resolve_tts_voice(initial_voice)
         self._tts_speed: float = 1.0
@@ -239,6 +240,37 @@ class AgentPipeline:
             return self._last_read_sentence_idx + 1
         return 0
 
+    def find_resume_sentence_idx(self, sentences: list[str]) -> int | None:
+        """Search the last-read words in the document and return the next sentence index.
+
+        Tries an exact phrase match first, then a majority-word match. Returns the
+        index AFTER the matched sentence so reading continues forward, not repeats.
+
+        Args:
+            sentences: Ordered list of document sentences to search.
+
+        Returns:
+            Index of the sentence immediately after the match, or ``None`` if
+            ``_last_read_words`` is empty or no match is found.
+        """
+        if not self._last_read_words or not sentences:
+            return None
+        search = self._last_read_words.lower()
+        words = search.split()
+        # Exact phrase match
+        for idx, sentence in enumerate(sentences):
+            if search in sentence.lower():
+                next_idx = idx + 1
+                return next_idx if next_idx < len(sentences) else None
+        # Majority-word match: at least (n-1) of n tracked words present
+        threshold = max(1, len(words) - 1)
+        for idx, sentence in enumerate(sentences):
+            sentence_lower = sentence.lower()
+            if sum(1 for w in words if w in sentence_lower) >= threshold:
+                next_idx = idx + 1
+                return next_idx if next_idx < len(sentences) else None
+        return None
+
     async def run_welcome(self) -> None:
         """Synthesise and stream the configured welcome message on session start.
 
@@ -366,6 +398,8 @@ class AgentPipeline:
                 await self._send_json({"type": "tts_start"})
             if sentence_idx is not None:
                 self._last_read_sentence_idx = sentence_idx
+                spoken = display_text or tts_text
+                self._last_read_words = " ".join(spoken.split()[-5:])
                 # _resume_from_sentence_idx is intentionally NOT updated here.
                 # It is only used to restore a cross-session saved position before
                 # reading starts; _run_document_read clears it immediately so that
@@ -457,8 +491,8 @@ class AgentPipeline:
             llm_ms: LLM latency forwarded to ``_play_tts_turn``.
 
         Returns:
-            Short status string describing what was read, or empty string if
-            the document is already finished.
+            Short status string describing what was read, or a "finished" message
+            if start_idx is past the last sentence.
         """
         self._interrupt_event.clear()
         doc = get_document_store().get_document(doc_id)
@@ -472,9 +506,22 @@ class AgentPipeline:
             return "I couldn't find that document."
 
         if start_idx >= doc.sentence_count:
+            logger.info(
+                "session_id={} event=doc_read_finished doc_id={} start_idx={} sentence_count={}",
+                self._session_id, doc_id, start_idx, doc.sentence_count,
+            )
+            # Reset so that a subsequent "keep reading" starts fresh from the beginning.
+            self._last_read_sentence_idx = -1
             self._resume_from_sentence_idx = None
             await self._send_json({"type": "doc_reading_pause"})
-            return ""
+            finished_msg = f"That's the end of {doc.title}. Would you like me to read it again from the beginning?"
+            await self._play_tts_turn(
+                user_text=user_text,
+                display_text=finished_msg,
+                utterances=self._split_text_for_tts(finished_msg),
+                llm_ms=llm_ms,
+            )
+            return finished_msg
 
         self._active_document_id = doc.doc_id
         # Clear cross-session restore index now that start_idx is confirmed.
@@ -542,12 +589,20 @@ class AgentPipeline:
                     and self._last_read_sentence_idx < 0
                 ):
                     self._resume_from_sentence_idx = 0
+                if direct_read.action == "continue_reading" and not direct_read.restart_from_beginning:
+                    _doc = get_document_store().get_document(self._active_document_id)
+                    _word_idx = self.find_resume_sentence_idx(_doc.sentences) if _doc else None
+                    start_idx = _word_idx if _word_idx is not None else self.get_read_start_idx(restart_from_beginning=False)
+                else:
+                    start_idx = self.get_read_start_idx(restart_from_beginning=direct_read.restart_from_beginning)
+                logger.info(
+                    "session_id={} event=direct_read_resume action={} last_words={!r} start_idx={}",
+                    self._session_id, direct_read.action, self._last_read_words, start_idx,
+                )
                 display_response = await self._run_document_read(
                     doc_id=self._active_document_id,
                     user_text=text,
-                    start_idx=self.get_read_start_idx(
-                        restart_from_beginning=direct_read.restart_from_beginning
-                    ),
+                    start_idx=start_idx,
                     llm_ms=0.0,
                 )
                 return
@@ -758,12 +813,21 @@ class AgentPipeline:
                     if decision.restart_from_beginning:
                         self._last_read_sentence_idx = -1
                         self._resume_from_sentence_idx = None
+
+                    if decision.action == "continue_reading":
+                        _word_idx = self.find_resume_sentence_idx(target_doc.sentences)
+                        start_idx = _word_idx if _word_idx is not None else self.get_read_start_idx(restart_from_beginning=False)
+                    else:
+                        start_idx = self.get_read_start_idx(restart_from_beginning=decision.restart_from_beginning)
+
+                    logger.info(
+                        "session_id={} event=llm_path_resume action={} last_words={!r} start_idx={}",
+                        self._session_id, decision.action, self._last_read_words, start_idx,
+                    )
                     display_response = await self._run_document_read(
                         doc_id=target_doc.doc_id,
                         user_text=text,
-                        start_idx=self.get_read_start_idx(
-                            restart_from_beginning=decision.restart_from_beginning
-                        ),
+                        start_idx=start_idx,
                         llm_ms=llm_ms,
                     )
 
